@@ -9,8 +9,7 @@ picks for your playlists, favourites, a shuffle, and the queue. Audio is streame
 a local `mpv`, which means the track also shows up on MPRIS — so your media keys
 and Omarchy's own media widget control it without any extra setup.
 
-<img src="docs/images/popup.png" width="520"
-     alt="The bar entry with the popup open below it: cover art, title, artist and album, a seek bar, transport and volume, a search box, and the quick picks.">
+<img width="681" height="736" alt="image" src="https://github.com/user-attachments/assets/2c397e83-23da-42d3-82b7-20739657dccc" />
 
 Colours are not the plugin's to pick — every screenshot here is just whichever
 Omarchy theme was active at the time.
