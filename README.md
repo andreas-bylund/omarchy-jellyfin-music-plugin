@@ -332,6 +332,17 @@ security decisions: HTTPS is never silently downgraded, discovered servers are
 never filled in for you, and the mpv socket has to sit somewhere only you can
 open. [SECURITY.md](SECURITY.md) explains those, and how to report a problem.
 
+## Uninstall
+
+```bash
+~/.config/omarchy/plugins/andreasbylund.jellyfin/bin/omarchy-jellyfin logout
+omarchy plugin remove andreasbylund.jellyfin
+```
+
+`logout` asks Jellyfin to revoke the access token before `remove` deletes the
+plugin. Your login config lives in `~/.config/omarchy/jellyfin/` — delete that
+directory too if you want no trace left.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
