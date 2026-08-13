@@ -1,0 +1,94 @@
+name: Bug report
+description: Something the plugin does that it should not, or will not do that it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Before pasting any output:** `omarchy-jellyfin status --json` prints a
+        cover-art URL with your Jellyfin **access token** in the query string.
+        Anyone holding that token can read your library and act as you on that
+        server until it is revoked. Redact it, or use plain `omarchy-jellyfin
+        status`, which prints no URL at all.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce it
+      placeholder: |
+        1. …
+        2. …
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where it happens
+      description: The QML is a thin view over the CLI, so this narrows it down a lot.
+      options:
+        - The bar widget or its popup
+        - The `omarchy-jellyfin` CLI
+        - Both
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: plugin-version
+    attributes:
+      label: Plugin version
+      description: The `version` field in `manifest.json`, or the commit you are on.
+    validations:
+      required: true
+
+  - type: input
+    id: omarchy-version
+    attributes:
+      label: Omarchy version
+      description: Output of `omarchy version`.
+    validations:
+      required: true
+
+  - type: input
+    id: mpv-version
+    attributes:
+      label: mpv version
+      description: Output of `mpv --version | head -1`.
+    validations:
+      required: true
+
+  - type: input
+    id: jellyfin-version
+    attributes:
+      label: Jellyfin server version
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Anything in the log
+      description: |
+        `journalctl --user -f` while reproducing it catches QML errors; a widget
+        that silently fails to appear is usually a stale shell rather than a
+        layout bug. Whatever the CLI printed on stderr helps too.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: token-check
+    attributes:
+      label: Before submitting
+      options:
+        - label: I have removed any access token from the output pasted above.
+          required: true

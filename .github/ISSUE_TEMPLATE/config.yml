@@ -1,0 +1,10 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/andreas-bylund/omarchy-jellyfin-music-plugin/security/advisories/new
+    about: >-
+      Report privately through a security advisory rather than a public issue.
+      This plugin holds a Jellyfin access token; see SECURITY.md.
+  - name: Jellyfin server itself
+    url: https://github.com/jellyfin/jellyfin/issues
+    about: Problems with the server rather than this plugin belong upstream.

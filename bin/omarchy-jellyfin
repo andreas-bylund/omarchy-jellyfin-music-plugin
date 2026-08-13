@@ -1,0 +1,1567 @@
+#!/usr/bin/env python3
+"""Control Jellyfin music playback from the Omarchy bar.
+
+Queries a Jellyfin server over its REST API and plays the resulting audio
+locally through mpv. mpv is kept alive in idle mode behind a JSON IPC socket so
+a queue survives between invocations, and because Arch loads mpv-mpris
+system-wide the current track shows up on MPRIS for the rest of the desktop --
+including Omarchy's own media widget and the media keys.
+
+Only the standard library is used, so the plugin has no install step beyond
+cloning it.
+"""
+
+import argparse
+import getpass
+import ipaddress
+import json
+import os
+import random
+import select
+import socket
+import ssl
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CLIENT_NAME = "Omarchy"
+CLIENT_VERSION = "0.1.0"
+
+CONFIG_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "omarchy",
+    "jellyfin",
+)
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+
+
+def runtime_dir(environ=None, uid=None):
+    """Where the mpv socket and the queue file live.
+
+    Whoever can reach that socket can tell mpv to run commands as us and can
+    read the stream URLs -- API token and all -- so it has to sit somewhere
+    only we can open. XDG_RUNTIME_DIR is exactly that directory. Without one
+    (a plain SSH session, say) /tmp is shared with every other user on the
+    box, so the name carries our uid and the directory gets checked rather
+    than trusted: see private_dir_error.
+    """
+    environ = os.environ if environ is None else environ
+    base = environ.get("XDG_RUNTIME_DIR")
+    if base:
+        return os.path.join(base, "omarchy-jellyfin")
+    uid = os.getuid() if uid is None else uid
+    return os.path.join(tempfile.gettempdir(), "omarchy-jellyfin-%d" % uid)
+
+
+RUNTIME_DIR = runtime_dir()
+SOCKET_PATH = os.path.join(RUNTIME_DIR, "mpv.sock")
+QUEUE_PATH = os.path.join(RUNTIME_DIR, "queue.json")
+
+HTTP_TIMEOUT = 10
+
+# mpv defaults to 100, which is the source at full scale -- next to a browser
+# playing at half that it arrives painfully loud. Start lower and let people
+# turn it up.
+DEFAULT_VOLUME = 70
+# mpv will amplify past 100 in software, which can clip. 100 is the source at
+# full scale, so that is the ceiling -- turn the system volume up instead.
+MAX_VOLUME = 100
+
+# What a search asks for, and how much of each. Artists and albums come first
+# and stay short: they are the rows you scan, while the tracks below them are
+# the ones you scroll. Ordered widest match to narrowest.
+SEARCH_LIMITS = (("MusicArtist", 5), ("MusicAlbum", 8), ("Audio", 25))
+# What `play --search` queues around the track you picked. Larger than the
+# listing above so the rest of the matches follow it, and sorted the same way
+# so the track you clicked is certain to be in there.
+SEARCH_PLAY_LIMIT = 100
+
+# How much of a listing browsing hands over at once. The whole level arrives in
+# one go so the panel can filter it as you type without a round trip per
+# keystroke, which is what makes a few thousand artists usable at all. Generous
+# rather than unlimited: a library bigger than this is one you search.
+BROWSE_LIMIT = 2000
+
+# How many tracks one queue holds. Jellyfin will happily hand over a library
+# of any size, but a queue that long is neither something you scroll nor
+# something you meant to ask for. Hitting it is said out loud rather than
+# quietly handing back a library that looks smaller than it is.
+QUEUE_LIMIT = 500
+
+
+class JellyfinError(Exception):
+    """Anything the user should see as a plain message rather than a traceback."""
+
+
+# --- pure helpers -----------------------------------------------------------
+# Kept free of I/O so tests/test_jellyfin.py can exercise them directly.
+
+
+def host_of(address):
+    """The host out of a "host", "host:port" or "[v6]:port" -- port dropped.
+
+    Bare IPv6 is all colons, so a colon only separates a port when there is
+    exactly one of them, or when brackets said so.
+    """
+    address = (address or "").strip().lower()
+    if address.startswith("["):
+        return address[1:].partition("]")[0]
+    if address.count(":") == 1:
+        return address.split(":")[0]
+    return address
+
+
+def is_local_host(host):
+    """Whether a host is on this machine or a private network.
+
+    Decides the scheme we guess for a bare "host:port": a Jellyfin on your desk
+    or your LAN almost always serves plain HTTP on 8096, while one reachable by
+    a public name is almost always behind TLS. It also decides whether we are
+    willing to fall back to plain HTTP at all -- see candidate_servers -- so
+    getting it wrong has a cost, and the address parsing is left to the
+    standard library rather than counting dots.
+    """
+    host = host_of(host)
+    if host in ("localhost", "0.0.0.0"):
+        return True
+    if host.endswith(".local") or host.endswith(".lan") or host.endswith(".home"):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        # Not an address at all. A bare name with no dots is a LAN hostname,
+        # not a public domain.
+        return "." not in host
+    return address.is_loopback or address.is_private or address.is_link_local
+
+
+def normalize_server(url, scheme=None):
+    """Accept what a human would type and return a usable base URL."""
+    url = (url or "").strip().rstrip("/")
+    if not url:
+        raise JellyfinError("Server URL is empty.")
+    if "://" not in url:
+        url = (scheme or ("http" if is_local_host(url) else "https")) + "://" + url
+    return url
+
+
+def candidate_servers(url):
+    """The URLs to try, best guess first.
+
+    A typed-in local address without a scheme is a guess either way, so rather
+    than making the user work out which one their server wants, we try http and
+    then https. An explicit scheme is taken at its word.
+
+    A public name only ever gets https. Falling back to http there would mean
+    that anyone able to break the TLS attempt -- blocking 443 is enough --
+    gets the login posted to them in clear text. Plain HTTP across the
+    internet stays possible, but it has to be typed out as http:// so it is a
+    decision rather than an accident.
+    """
+    url = (url or "").strip().rstrip("/")
+    if not url:
+        raise JellyfinError("Server URL is empty.")
+    if "://" in url:
+        return [normalize_server(url)]
+    if not is_local_host(url):
+        return [normalize_server(url)]
+    return [normalize_server(url, "http"), normalize_server(url, "https")]
+
+
+def private_dir_error(path, info, uid):
+    """Why a directory cannot hold the mpv socket, or None when it can.
+
+    Only matters when we are in /tmp, where another user may have created the
+    directory before us -- os.makedirs(exist_ok=True) would take theirs
+    without a word. Pure, so the cases nobody can reproduce locally (a
+    directory owned by somebody else) are still testable.
+    """
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return "%s is not a directory" % path
+    if info.st_uid != uid:
+        return "%s belongs to another user (uid %d)" % (path, info.st_uid)
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        return "%s is open to other users (mode %04o)" % (path, stat.S_IMODE(info.st_mode))
+    return None
+
+
+def items_of(result):
+    """The Items array out of an /Items reply, tolerating an empty body."""
+    return (result or {}).get("Items") or []
+
+
+def truncation_warning(count, limit, default_limit=QUEUE_LIMIT):
+    """The note to print when a listing came back capped, or None.
+
+    Only for the cap we impose ourselves. A limit the user asked for -- `play
+    --shuffle --limit 50` -- did exactly what it said, and saying so every
+    time would be noise.
+    """
+    if limit != default_limit or count < limit:
+        return None
+    return "stopped at %d tracks, which is as long as one queue gets." % limit
+
+
+def parse_interface_addresses(ip_output):
+    """Pull the a.b.c.d/nn addresses out of `ip -4 -o addr` output."""
+    found = []
+    for line in (ip_output or "").splitlines():
+        parts = line.split()
+        for index, token in enumerate(parts):
+            if token == "inet" and index + 1 < len(parts):
+                found.append(parts[index + 1])
+    return found
+
+
+def broadcast_targets(cidrs):
+    """Where to send the discovery probe, and which local address to send from.
+
+    The plain 255.255.255.255 broadcast leaves by the default route, which a
+    VPN owns -- so a server sitting on the actual LAN never hears it. Sending a
+    subnet-directed broadcast bound to each local address reaches every network
+    this machine is really on, tunnel or not.
+    """
+    targets = [("255.255.255.255", None)]
+    for cidr in cidrs:
+        try:
+            interface = ipaddress.ip_interface(cidr)
+        except ValueError:
+            continue
+        if interface.network.prefixlen >= 31:
+            continue
+        target = (str(interface.network.broadcast_address), str(interface.ip))
+        if target not in targets:
+            targets.append(target)
+    return targets
+
+
+def parse_discovery(payloads):
+    """Turn Jellyfin's UDP discovery replies into a deduplicated server list."""
+    servers = []
+    seen = set()
+    for payload in payloads:
+        try:
+            data = json.loads(payload)
+        except (ValueError, TypeError):
+            continue
+        address = (data.get("Address") or "").rstrip("/")
+        if not address or address in seen:
+            continue
+        seen.add(address)
+        servers.append({"address": address, "name": data.get("Name") or address})
+    return servers
+
+
+def auth_header(token, device_id):
+    """Jellyfin's bespoke Authorization header. Token is omitted before login."""
+    parts = [
+        'Client="%s"' % CLIENT_NAME,
+        'Device="%s"' % socket.gethostname(),
+        'DeviceId="%s"' % device_id,
+        'Version="%s"' % CLIENT_VERSION,
+    ]
+    if token:
+        parts.append('Token="%s"' % token)
+    return "MediaBrowser " + ", ".join(parts)
+
+
+def stream_url(config, item_id):
+    """Direct-play URL. mpv handles every container Jellyfin stores natively,
+    so we ask for the original file rather than making the server transcode."""
+    query = urllib.parse.urlencode(
+        {"static": "true", "api_key": config["token"]}
+    )
+    # Ids come from the server, but they land in a URL path, and quoting them
+    # is cheaper than trusting that they always will.
+    return "%s/Audio/%s/stream?%s" % (
+        config["server"],
+        urllib.parse.quote(str(item_id), safe=""),
+        query,
+    )
+
+
+def track_from_item(item):
+    """Flatten a Jellyfin item into what the queue and the bar widget need."""
+    artists = item.get("Artists") or []
+    artist = ", ".join(artists) if artists else (item.get("AlbumArtist") or "")
+    ticks = item.get("RunTimeTicks") or 0
+    return {
+        "id": item.get("Id", ""),
+        "title": item.get("Name", "Unknown"),
+        "artist": artist,
+        "album": item.get("Album", ""),
+        # Cover art hangs off the album, falling back to the track for singles
+        # and anything filed without one.
+        "artId": item.get("AlbumId") or item.get("Id", ""),
+        # Jellyfin counts in 100ns ticks; everything downstream wants seconds.
+        "duration": int(ticks / 10_000_000) if ticks else 0,
+    }
+
+
+def search_entry(item):
+    """Flatten one search hit -- track, album or artist -- into a uniform row.
+
+    The three types come back from Jellyfin with different fields, but the
+    panel lists them together, so which field becomes the label is decided
+    here rather than in QML.
+    """
+    kind = item.get("Type") or "Audio"
+    if kind == "MusicArtist":
+        return {
+            "type": "artist",
+            "id": item.get("Id", ""),
+            "name": item.get("Name", "Unknown"),
+            "detail": "",
+        }
+    if kind == "MusicAlbum":
+        # An album is filed under its album artist; the per-track Artists list
+        # is the fallback for a compilation credited track by track.
+        artists = item.get("AlbumArtist") or ", ".join(item.get("Artists") or [])
+        return {
+            "type": "album",
+            "id": item.get("Id", ""),
+            "name": item.get("Name", "Unknown"),
+            "detail": artists,
+        }
+    track = track_from_item(item)
+    return {
+        "type": "track",
+        "id": track["id"],
+        "name": track["title"],
+        "detail": track["artist"],
+    }
+
+
+# Browsing walks the library a level at a time -- artists, then their albums,
+# then the tracks -- and every level is drawn by the same panel rows, so they
+# all flatten to the same {id, name, detail} shape. Which type a row is comes
+# from the level it was listed in, not from the row, so it does not need to be
+# repeated on every entry the way a mixed search result has to.
+
+
+def named_entry(item, detail=""):
+    """A listing row for something with nothing to say beneath its name."""
+    return {"id": item.get("Id", ""), "name": item.get("Name", "Unknown"), "detail": detail}
+
+
+def album_entry(item, implied_artist=False):
+    """One album as a listing row.
+
+    Under an artist the credit is already known from the level above, so the
+    year takes the detail column instead -- which is also what makes a
+    discography read as one.
+    """
+    if implied_artist:
+        year = item.get("ProductionYear")
+        return named_entry(item, str(year) if year else "")
+    # The per-track Artists list is the fallback for a compilation credited
+    # track by track, the same way search_entry does it.
+    return named_entry(item, item.get("AlbumArtist") or ", ".join(item.get("Artists") or []))
+
+
+def track_entries(tracks):
+    """Listing rows for a run of already-flattened tracks.
+
+    The artist column goes away when every track carries the same one: down an
+    album by a single artist it is that album's own credit repeated twelve
+    times, which is noise rather than information. A compilation, or a playlist
+    that wanders, keeps it.
+    """
+    show_artist = len({track["artist"] for track in tracks}) > 1
+    return [
+        {
+            "id": track["id"],
+            "name": track["title"],
+            "detail": track["artist"] if show_artist else "",
+        }
+        for track in tracks
+    ]
+
+
+def browse_params(item_type, user_id, limit, artist_id=None):
+    """The /Items query behind one browse listing.
+
+    Albums are filtered by ArtistIds rather than AlbumArtistIds, deliberately
+    and in step with `play --artist`: what the discography lists is what
+    playing that artist actually gives you, guest spots included. Those are
+    ordered by year, which is how a discography is read; every other listing is
+    alphabetical, which is how you scan for a name.
+    """
+    params = {
+        "IncludeItemTypes": item_type,
+        "Recursive": "true",
+        "userId": user_id,
+        "SortBy": "SortName",
+        "Limit": limit,
+    }
+    if artist_id:
+        params["ArtistIds"] = artist_id
+        params["SortBy"] = "ProductionYear,SortName"
+    return params
+
+
+def art_url(config, track, size=192):
+    """Cover art for a track, or "" when there is nothing to point at.
+
+    Jellyfin serves images straight to an authenticated URL, so the widget can
+    hand this to a plain Image rather than caching anything itself.
+    """
+    art_id = (track or {}).get("artId")
+    if not art_id:
+        return ""
+    query = urllib.parse.urlencode(
+        {"fillHeight": size, "fillWidth": size, "quality": 90, "api_key": config["token"]}
+    )
+    return "%s/Items/%s/Images/Primary?%s" % (
+        config["server"],
+        urllib.parse.quote(str(art_id), safe=""),
+        query,
+    )
+
+
+def media_title(track):
+    """The title mpv should report, so MPRIS shows more than a stream URL.
+
+    Deliberately the bare title: we direct-play the original file, so mpv reads
+    its embedded tags and mpv-mpris publishes artist and album from those.
+    Folding the artist in here too would show it twice in the bar.
+    """
+    return track.get("title") or "Unknown"
+
+
+def clamp_volume(value):
+    """Coerce anything to a usable mpv volume level."""
+    try:
+        level = int(round(float(value)))
+    except (TypeError, ValueError):
+        raise JellyfinError("Volume must be a number, or 'up' / 'down'.")
+    return max(0, min(MAX_VOLUME, level))
+
+
+def resolve_volume(current, request, step=5):
+    """Turn a request -- an absolute level, or 'up' / 'down' -- into a level."""
+    if request is None:
+        return clamp_volume(current)
+    text = str(request).strip().lower()
+    if text == "up":
+        return clamp_volume(current + step)
+    if text == "down":
+        return clamp_volume(current - step)
+    try:
+        requested = float(text)
+    except (TypeError, ValueError):
+        raise JellyfinError("Volume must be a number, or 'up' / 'down'.")
+    # Stepping down from 2 clamping to 0 is the user asking for quiet, but an
+    # absolute negative is a caller that lost track of its own state. Clamping
+    # that one would silently mute the music and look like the volume simply
+    # moved, so it is refused instead and the level stays where it was.
+    if requested < 0:
+        raise JellyfinError("Volume must be between 0 and %d." % MAX_VOLUME)
+    return clamp_volume(requested)
+
+
+def format_duration(seconds):
+    seconds = int(seconds or 0)
+    if seconds <= 0:
+        return "0:00"
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return "%d:%02d:%02d" % (hours, minutes, secs)
+    return "%d:%02d" % (minutes, secs)
+
+
+def merge_status(mpv_state, queue, stored_volume=DEFAULT_VOLUME):
+    """Combine what mpv knows (position, paused) with the metadata we queued.
+
+    mpv only ever sees stream URLs, so the queue file is the authority on which
+    track is playing; mpv's playlist-pos is the index into it. With mpv not
+    running the volume still has to be reported, so the panel's slider shows
+    the level the next track will start at rather than snapping to zero.
+    """
+    if mpv_state is None:
+        return {
+            "running": False,
+            "playing": False,
+            "track": None,
+            "queue": len(queue),
+            "volume": clamp_volume(stored_volume),
+        }
+
+    pos = mpv_state.get("playlist-pos")
+    track = None
+    if isinstance(pos, int) and 0 <= pos < len(queue):
+        track = queue[pos]
+
+    duration = mpv_state.get("duration") or (track or {}).get("duration") or 0
+    elapsed = mpv_state.get("time-pos") or 0
+    return {
+        "running": True,
+        "playing": not mpv_state.get("pause", False) and track is not None,
+        "paused": bool(mpv_state.get("pause", False)),
+        "track": track,
+        "index": pos if isinstance(pos, int) else -1,
+        "queue": len(queue),
+        "elapsed": int(elapsed),
+        "duration": int(duration),
+        "elapsedText": format_duration(elapsed),
+        "durationText": format_duration(duration),
+        "progress": (elapsed / duration) if duration else 0.0,
+        "volume": clamp_volume(
+            mpv_state["volume"] if mpv_state.get("volume") is not None else stored_volume
+        ),
+    }
+
+
+# --- config -----------------------------------------------------------------
+
+
+def stored_volume():
+    """The level a fresh mpv should start at."""
+    config = load_config(required=False) or {}
+    return clamp_volume(config.get("volume", DEFAULT_VOLUME))
+
+
+def persist_volume(level):
+    """Remember the level so it survives mpv exiting and the machine rebooting."""
+    config = load_config(required=False)
+    if not config:
+        return
+    config["volume"] = clamp_volume(level)
+    save_config(config)
+
+
+# What every authenticated call needs to be there. Checked up front so a
+# config written by an older version fails as a sentence telling you to log in
+# again, rather than as a KeyError halfway through a request.
+REQUIRED_CONFIG = ("server", "token", "userId", "deviceId")
+
+
+def missing_config_keys(config, required=REQUIRED_CONFIG):
+    """Which credentials a stored config is missing. Empty means usable."""
+    if not isinstance(config, dict):
+        return list(required)
+    return [key for key in required if not config.get(key)]
+
+
+def load_config(required=True):
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+            config = json.load(handle)
+    except FileNotFoundError:
+        if required:
+            raise JellyfinError(
+                "Not logged in. Run: omarchy-jellyfin login"
+            )
+        return None
+    except (OSError, ValueError) as exc:
+        raise JellyfinError("Could not read %s: %s" % (CONFIG_PATH, exc))
+
+    if required:
+        missing = missing_config_keys(config)
+        if missing:
+            raise JellyfinError(
+                "Stored credentials are incomplete (missing %s). "
+                "Run: omarchy-jellyfin login" % ", ".join(missing)
+            )
+    return config if isinstance(config, dict) else None
+
+
+def save_config(config):
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    # Written beside the real file and moved into place. A crash mid-write
+    # would otherwise truncate the config and lose the token, and since the
+    # new file brings its own mode along, a config.json left world-readable by
+    # an older version gets repaired rather than kept -- the access token is a
+    # bearer credential and has no business being readable by anyone else.
+    temp_path = CONFIG_PATH + ".new"
+    try:
+        os.unlink(temp_path)
+    except FileNotFoundError:
+        pass
+    fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(config, handle, indent=2)
+            handle.write("\n")
+        os.replace(temp_path, CONFIG_PATH)
+    except BaseException:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
+
+
+# --- Jellyfin API -----------------------------------------------------------
+
+
+def discover_servers(timeout=2.0):
+    """Ask the local network which Jellyfin servers are out there.
+
+    Jellyfin listens for a UDP broadcast on 7359 and answers with its own
+    address, which saves the user from knowing their server's IP. It only ever
+    finds servers on the same network -- a remote one still gets typed in.
+    """
+    try:
+        completed = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show", "scope", "global"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        cidrs = parse_interface_addresses(completed.stdout)
+    except (OSError, subprocess.SubprocessError):
+        cidrs = []
+
+    replies = []
+    sockets = []
+    for address, source in broadcast_targets(cidrs):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.setblocking(False)
+            if source:
+                sock.bind((source, 0))
+            sock.sendto(b"who is JellyfinServer?", (address, 7359))
+            sockets.append(sock)
+        except OSError:
+            # An interface that will not carry a broadcast is not an error;
+            # discovery is a convenience and the others may still answer.
+            sock.close()
+
+    deadline = time.time() + timeout
+    while sockets and time.time() < deadline:
+        readable, _, _ = select.select(sockets, [], [], max(0, deadline - time.time()))
+        for sock in readable:
+            try:
+                payload, _ = sock.recvfrom(4096)
+            except OSError:
+                continue
+            replies.append(payload.decode("utf-8", "replace"))
+
+    for sock in sockets:
+        sock.close()
+    return parse_discovery(replies)
+
+
+def probe_server(url, insecure=False):
+    """Whether a Jellyfin server answers here. Returns its name, or None."""
+    try:
+        request = urllib.request.Request(
+            url + "/System/Info/Public", headers={"Accept": "application/json"}
+        )
+        with urllib.request.urlopen(request, timeout=5, context=ssl_context(insecure)) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        return data.get("ServerName") or "Jellyfin"
+    except Exception:
+        return None
+
+
+def ssl_context(insecure):
+    """Opt-in escape hatch for the self-signed certificates that are normal on
+    a home server. Only ever set when the user passes --insecure."""
+    if not insecure:
+        return None
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+def api_get(config, path, params=None):
+    url = config["server"] + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    return _api_request(config, url, None)
+
+
+def api_post(config, path, payload, unauthorized=None):
+    return _api_request(config, config["server"] + path, payload, unauthorized)
+
+
+def _api_request(config, url, payload, unauthorized=None):
+    data = None
+    headers = {
+        "Authorization": auth_header(config.get("token"), config["deviceId"]),
+        "Accept": "application/json",
+    }
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    request = urllib.request.Request(url, data=data, headers=headers)
+    try:
+        context = ssl_context(config.get("insecure", False))
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT, context=context) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            # During login a 401 means bad credentials; everywhere else it
+            # means the stored token has been revoked or expired.
+            raise JellyfinError(
+                unauthorized or "Jellyfin rejected the token. Run: omarchy-jellyfin login"
+            )
+        raise JellyfinError("Jellyfin returned HTTP %s for %s" % (exc.code, url))
+    except urllib.error.URLError as exc:
+        raise JellyfinError("Could not reach %s: %s" % (config["server"], exc.reason))
+
+    if not body:
+        return None
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        # Usually a reverse proxy answering with its own HTML page. The widget
+        # prints stderr straight into its panel, so this has to read as a
+        # sentence rather than arrive as a traceback.
+        raise JellyfinError(
+            "%s answered with something that is not JSON. Is that address really "
+            "a Jellyfin server?" % config["server"]
+        )
+
+
+def fetch_tracks(config, params):
+    """Every track listing goes through /Items with the same shape."""
+    base = {
+        "IncludeItemTypes": "Audio",
+        "Recursive": "true",
+        "Fields": "Artists,Album,RunTimeTicks",
+        "userId": config["userId"],
+        "Limit": QUEUE_LIMIT,
+    }
+    base.update(params)
+    tracks = [track_from_item(item) for item in items_of(api_get(config, "/Items", base))]
+    warning = truncation_warning(len(tracks), base["Limit"])
+    if warning:
+        print("omarchy-jellyfin: %s" % warning, file=sys.stderr)
+    return tracks
+
+
+def playlist_tracks(config, playlist_id):
+    """The tracks of one playlist, in the order it keeps them.
+
+    A playlist is the one listing that does not come from /Items: that endpoint
+    would sort it, and a playlist's whole point is that somebody already put it
+    in an order.
+    """
+    result = api_get(
+        config,
+        "/Playlists/%s/Items" % urllib.parse.quote(str(playlist_id), safe=""),
+        {"userId": config["userId"], "Fields": "Artists,Album,RunTimeTicks"},
+    )
+    return [track_from_item(item) for item in items_of(result)]
+
+
+def search_library(config, query, limits=SEARCH_LIMITS):
+    """Look for artists, albums and tracks matching a query, in that order.
+
+    One request per type rather than a single mixed one: a query that matches
+    two hundred tracks would otherwise fill a shared limit with them and push
+    the artist -- usually the thing you were actually after -- off the end.
+    """
+    entries = []
+    for item_type, limit in limits:
+        result = api_get(
+            config,
+            "/Items",
+            {
+                "SearchTerm": query,
+                "IncludeItemTypes": item_type,
+                "Recursive": "true",
+                "Fields": "Artists,Album,RunTimeTicks",
+                "userId": config["userId"],
+                "SortBy": "SortName",
+                "Limit": limit,
+            },
+        )
+        entries.extend(search_entry(item) for item in items_of(result))
+    return entries
+
+
+# --- mpv --------------------------------------------------------------------
+
+
+def ensure_runtime_dir():
+    """Create the runtime directory, and refuse to use one we do not own."""
+    os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
+    problem = private_dir_error(RUNTIME_DIR, os.lstat(RUNTIME_DIR), os.getuid())
+    if problem:
+        raise JellyfinError(
+            "%s, so it is not safe to put the mpv socket there: anyone who can\n"
+            "  reach that socket can control playback and read your Jellyfin\n"
+            "  token. Remove it, or run with XDG_RUNTIME_DIR set." % problem
+        )
+    return RUNTIME_DIR
+
+
+def mpv_running():
+    return os.path.exists(SOCKET_PATH) and _mpv_send({"command": ["get_property", "idle-active"]}) is not None
+
+
+def _mpv_exchange(messages):
+    """Send a batch of commands down one connection and collect the replies.
+
+    Returns a list as long as `messages`, holding each command's reply or None
+    -- and all None when mpv is not listening, which every caller reads as
+    "nothing is playing" rather than an error.
+
+    One connection for the whole batch, because the callers come in batches:
+    a status poll asks for six properties several times a minute for as long
+    as the bar is up, and queueing a shuffle sends one command per track.
+
+    mpv interleaves asynchronous events with replies and answers in whatever
+    order it finishes, so each request carries a request_id and replies are
+    matched on it rather than on arrival order. Events carry no "error" key
+    and are skipped.
+    """
+    if not messages:
+        return []
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        conn.settimeout(2)
+        conn.connect(SOCKET_PATH)
+    except (OSError, socket.timeout):
+        # Created before the try so it still gets closed here. This is the
+        # ordinary path, not a rare one -- mpv is not running most of the time
+        # the bar polls -- so leaking the descriptor would be a steady drip.
+        conn.close()
+        return [None] * len(messages)
+
+    replies = [None] * len(messages)
+    try:
+        payload = b""
+        for index, message in enumerate(messages):
+            payload += json.dumps(dict(message, request_id=index)).encode("utf-8") + b"\n"
+        conn.sendall(payload)
+
+        outstanding = len(messages)
+        buffer = b""
+        # A queue of several hundred tracks is several hundred replies, so the
+        # window scales with the batch rather than being a flat two seconds.
+        deadline = time.time() + max(2, 0.02 * len(messages))
+        while outstanding and time.time() < deadline:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                try:
+                    parsed = json.loads(line.decode("utf-8"))
+                except ValueError:
+                    continue
+                if "error" not in parsed:
+                    continue
+                index = parsed.get("request_id")
+                if isinstance(index, int) and 0 <= index < len(replies) and replies[index] is None:
+                    replies[index] = parsed
+                    outstanding -= 1
+        return replies
+    except (OSError, socket.timeout):
+        # Whatever came back before it went quiet. The commands themselves
+        # were already written, so a queue that loaded but stopped answering
+        # is still a loaded queue.
+        return replies
+    finally:
+        conn.close()
+
+
+def _mpv_send(message):
+    return _mpv_exchange([message])[0]
+
+
+def mpv_command(*args):
+    return _mpv_send({"command": list(args)})
+
+
+def mpv_get_many(props):
+    """Read several mpv properties over one connection."""
+    replies = _mpv_exchange([{"command": ["get_property", prop]} for prop in props])
+    return {
+        prop: (reply.get("data") if reply and reply.get("error") == "success" else None)
+        for prop, reply in zip(props, replies)
+    }
+
+
+def mpv_get(prop):
+    return mpv_get_many((prop,))[prop]
+
+
+def ensure_mpv():
+    """Start a detached idle mpv if one is not already listening."""
+    if mpv_running():
+        return
+    ensure_runtime_dir()
+    if os.path.exists(SOCKET_PATH):
+        os.unlink(SOCKET_PATH)
+
+    subprocess.Popen(
+        [
+            "mpv",
+            "--no-video",
+            "--idle=yes",
+            "--no-terminal",
+            "--input-ipc-server=" + SOCKET_PATH,
+            # Gapless-ish behaviour for albums, and no window ever.
+            "--audio-display=no",
+            "--prefetch-playlist=yes",
+            "--volume=%d" % stored_volume(),
+            # Levels ReplayGain-tagged tracks against each other, so a loud
+            # remaster does not blast after a quiet album. A no-op when the
+            # files carry no tags.
+            "--replaygain=track",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if mpv_running():
+            return
+        time.sleep(0.05)
+    raise JellyfinError("mpv did not start. Is mpv installed?")
+
+
+def read_queue():
+    try:
+        with open(QUEUE_PATH, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return []
+
+
+def write_queue(tracks):
+    ensure_runtime_dir()
+    # O_NOFOLLOW: the directory has just been vouched for, so a queue file that
+    # is suddenly a symlink is someone trying to make us write somewhere else.
+    fd = os.open(QUEUE_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(tracks, handle)
+
+
+def queue_index_of(tracks, item_id):
+    """Where a track sits in the queue, or 0 when it is not in it."""
+    for index, track in enumerate(tracks):
+        if track["id"] == item_id:
+            return index
+    return 0
+
+
+def enqueue_commands(config, tracks, replace=True, start_id=None):
+    """The exact mpv command sequence that loads a queue and starts it.
+
+    Pure, because the ordering here is load-bearing and was wrong once: see the
+    append/append-play note below.
+    """
+    commands = []
+    if replace:
+        commands.append(["playlist-clear"])
+        commands.append(["stop"])
+
+    for track in tracks:
+        # Always plain "append", never "append-play": while the first track is
+        # still opening its HTTP stream mpv counts itself as not playing, so an
+        # append-play would win that race and start the track it just appended
+        # instead -- leaving mpv on track 2 while our queue said track 1.
+        # Playback is started explicitly below.
+        options = {"force-media-title": media_title(track)}
+        # mpv fetches the audio itself, so it needs telling about a self-signed
+        # certificate separately from our own API calls.
+        if config.get("insecure"):
+            options["tls-verify"] = "no"
+        commands.append(["loadfile", stream_url(config, track["id"]), "append", -1, options])
+
+    # Picking one song out of a list should still queue the rest of it, so we
+    # load everything and then jump, rather than playing a queue of one.
+    commands.append(["playlist-play-index", queue_index_of(tracks, start_id) if start_id else 0])
+    commands.append(["set_property", "pause", False])
+    return commands
+
+
+def enqueue(config, tracks, replace=True, start_id=None):
+    if not tracks:
+        raise JellyfinError("Nothing to play.")
+    ensure_mpv()
+    # Written first: a status poll landing mid-load should see the queue that
+    # is being loaded, not the previous one.
+    write_queue(tracks)
+    # One connection for the lot. A 500-track shuffle is 500-odd commands, and
+    # a connect plus a round trip each was long enough to watch happen.
+    _mpv_exchange(
+        [{"command": command} for command in enqueue_commands(config, tracks, replace, start_id)]
+    )
+
+
+# --- commands ---------------------------------------------------------------
+
+
+def choose_server(args):
+    """Work out which server to talk to, asking only for what we cannot find.
+
+    Order matters: an explicit --server wins, otherwise we look on the network
+    first because a local server is the case where the user is least likely to
+    know the address by heart. Typing one in is always available as a fallback.
+    """
+    typed = args.server
+    if not typed:
+        print("Looking for Jellyfin servers on this network…")
+        found = discover_servers()
+        for index, server in enumerate(found, start=1):
+            print("  %d) %s  (%s)" % (index, server["name"], server["address"]))
+        if found:
+            choice = input(
+                "Pick a server [1-%d], or type an address: " % len(found)
+            ).strip()
+            if choice.isdigit() and 1 <= int(choice) <= len(found):
+                typed = found[int(choice) - 1]["address"]
+            else:
+                typed = choice
+        else:
+            print("  none found — a server elsewhere needs its address.")
+            typed = input("Jellyfin server URL: ").strip()
+
+    attempted = []
+    for candidate in candidate_servers(typed):
+        attempted.append(candidate)
+        name = probe_server(candidate, args.insecure)
+        if name:
+            print("Found %s at %s" % (name, candidate))
+            return candidate
+
+    hint = (
+        "  Check the address and that the server is running. If it uses a\n"
+        "  self-signed certificate, add --insecure."
+    )
+    if not is_local_host(typed) and "://" not in (typed or ""):
+        # We only tried https, on purpose. Say so, rather than leaving them to
+        # wonder why an http-only server is not being found.
+        hint += (
+            "\n  Only https was tried, because sending a password over plain HTTP\n"
+            "  to a public address would expose it. Write out http:// to insist."
+        )
+    raise JellyfinError(
+        "No Jellyfin server answered at %s.\n%s" % (" or ".join(attempted), hint)
+    )
+
+
+def cmd_discover(args):
+    found = discover_servers()
+    if args.json:
+        print(json.dumps(found))
+        return
+    if not found:
+        print("No Jellyfin servers found on this network.")
+        return
+    for server in found:
+        print("%s\t%s" % (server["address"], server["name"]))
+
+
+def cmd_server(args):
+    config = load_config(required=False)
+    configured = bool(config and config.get("token"))
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "configured": configured,
+                    "server": (config or {}).get("server", ""),
+                    "userName": (config or {}).get("userName", ""),
+                }
+            )
+        )
+        return
+    if not configured:
+        print("No server configured. Run: omarchy-jellyfin login")
+        return
+    print("%s (%s)" % (config["server"], config.get("userName", "unknown user")))
+
+
+def cmd_login(args):
+    server = choose_server(args)
+    username = args.user or input("Username: ")
+    if args.password_stdin:
+        # Anything that can read /proc sees argv, so the settings panel hands
+        # the password over this way instead.
+        password = sys.stdin.readline().rstrip("\n")
+    elif args.password is not None:
+        password = args.password
+    else:
+        password = getpass.getpass("Password: ")
+
+    existing = load_config(required=False) or {}
+    device_id = existing.get("deviceId") or ("omarchy-" + os.urandom(8).hex())
+    config = {
+        "server": server,
+        "deviceId": device_id,
+        "token": None,
+        "insecure": args.insecure,
+    }
+
+    result = api_post(
+        config,
+        "/Users/AuthenticateByName",
+        {"Username": username, "Pw": password},
+        unauthorized="Wrong username or password.",
+    )
+    user = (result or {}).get("User") or {}
+    if not result or not result.get("AccessToken") or not user.get("Id"):
+        raise JellyfinError("Login failed: the server did not return a usable session.")
+
+    user_name = user.get("Name") or username
+    save_config(
+        {
+            "server": server,
+            "deviceId": device_id,
+            "insecure": args.insecure,
+            "token": result["AccessToken"],
+            "userId": user["Id"],
+            "userName": user_name,
+        }
+    )
+    if args.json:
+        print(json.dumps({"ok": True, "server": server, "userName": user_name}))
+    else:
+        print("Logged in as %s on %s" % (user_name, server))
+
+
+def cmd_logout(_args):
+    config = load_config(required=False)
+    # Enough of a config to make the call at all -- a half-written one still
+    # gets deleted below, it just cannot be revoked first.
+    if not missing_config_keys(config, ("server", "token", "deviceId")):
+        # Deleting the file locally leaves the token valid on the server for
+        # good, so a copy taken off this machine beforehand would keep working.
+        # Ask Jellyfin to retire it first.
+        try:
+            api_post(config, "/Sessions/Logout", {})
+        except JellyfinError as exc:
+            # The local copy goes either way: a token we cannot reach the
+            # server to revoke is still one worth getting off this machine.
+            print(
+                "omarchy-jellyfin: could not revoke the token on the server (%s).\n"
+                "  Removing it locally anyway -- revoke the device in Jellyfin's\n"
+                "  dashboard if that matters." % exc,
+                file=sys.stderr,
+            )
+    try:
+        os.unlink(CONFIG_PATH)
+    except FileNotFoundError:
+        pass
+    print("Credentials removed.")
+
+
+def cmd_status(args):
+    queue = read_queue()
+    state = None
+    if os.path.exists(SOCKET_PATH):
+        # All six down one connection. The widget polls this for as long as
+        # the bar is up, so it is the one call worth keeping cheap.
+        props = mpv_get_many(
+            ("pause", "time-pos", "duration", "playlist-pos", "playlist-count", "volume")
+        )
+        # A socket with no answering mpv means a stale file from a killed process.
+        if props["playlist-count"] is not None or props["pause"] is not None:
+            state = props
+
+    status = merge_status(state, queue, stored_volume())
+    if args.json:
+        # The widget needs the art URL, which is the one part of the status
+        # that requires credentials.
+        config = load_config(required=False)
+        status["art"] = art_url(config, status["track"]) if (config and status["track"]) else ""
+        print(json.dumps(status))
+        return
+    if not status["running"] or not status["track"]:
+        print("Not playing.")
+        return
+    track = status["track"]
+    print(
+        "%s %s - %s  [%s / %s]"
+        % (
+            "||" if status["paused"] else ">",
+            track["artist"] or "Unknown artist",
+            track["title"],
+            status["elapsedText"],
+            status["durationText"],
+        )
+    )
+
+
+def cmd_playlists(args):
+    config = load_config()
+    result = api_get(
+        config,
+        "/Items",
+        {
+            "IncludeItemTypes": "Playlist",
+            "Recursive": "true",
+            "userId": config["userId"],
+            "SortBy": "SortName",
+        },
+    )
+    _print_entries([named_entry(item) for item in items_of(result)], args.json)
+
+
+def cmd_artists(args):
+    config = load_config()
+    result = api_get(
+        config, "/Items", browse_params("MusicArtist", config["userId"], args.limit)
+    )
+    _print_entries([named_entry(item) for item in items_of(result)], args.json, args.limit)
+
+
+def cmd_albums(args):
+    config = load_config()
+    result = api_get(
+        config,
+        "/Items",
+        browse_params("MusicAlbum", config["userId"], args.limit, args.artist),
+    )
+    entries = [
+        album_entry(item, implied_artist=bool(args.artist)) for item in items_of(result)
+    ]
+    _print_entries(entries, args.json, args.limit)
+
+
+def cmd_tracks(args):
+    config = load_config()
+    if args.playlist:
+        tracks = playlist_tracks(config, args.playlist)
+    else:
+        tracks = fetch_tracks(
+            config, {"ParentId": args.album, "SortBy": "ParentIndexNumber,IndexNumber"}
+        )
+    _print_entries(track_entries(tracks), args.json)
+
+
+def cmd_favorites(args):
+    config = load_config()
+    tracks = fetch_tracks(
+        config, {"Filters": "IsFavorite", "SortBy": "Album,ParentIndexNumber,IndexNumber"}
+    )
+    if args.json:
+        print(json.dumps(tracks))
+        return
+    for track in tracks:
+        print("%s - %s" % (track["artist"] or "Unknown artist", track["title"]))
+
+
+def cmd_search(args):
+    config = load_config()
+    query = (args.query or "").strip()
+    if not query:
+        raise JellyfinError("Nothing to search for.")
+    entries = search_library(config, query)
+    if args.json:
+        print(json.dumps(entries))
+        return
+    for entry in entries:
+        # The id comes along because it is what `play --artist/--album/--item`
+        # wants next, the same way `playlists` prints one.
+        label = entry["name"]
+        if entry["detail"]:
+            label += " - " + entry["detail"]
+        print("%s\t%s\t%s" % (entry["type"], entry["id"], label))
+
+
+def _print_entries(entries, as_json, limit=None):
+    """Print one listing, in the shape `play --album/--playlist/--item` wants next.
+
+    The cap is said out loud rather than quietly handing back a library that
+    looks smaller than it is -- on stderr, so `--json` stays parseable.
+    """
+    if limit and len(entries) >= limit:
+        print(
+            "omarchy-jellyfin: stopped at %d entries, which is as long as one "
+            "listing gets. Search for what you are missing." % limit,
+            file=sys.stderr,
+        )
+    if as_json:
+        print(json.dumps(entries))
+        return
+    for entry in entries:
+        label = entry["name"]
+        if entry["detail"]:
+            label += " - " + entry["detail"]
+        print("%s\t%s" % (entry["id"], label))
+
+
+def cmd_play(args):
+    config = load_config()
+
+    if args.playlist:
+        tracks = playlist_tracks(config, args.playlist)
+    elif args.album:
+        tracks = fetch_tracks(
+            config, {"ParentId": args.album, "SortBy": "ParentIndexNumber,IndexNumber"}
+        )
+    elif args.artist:
+        # Everything they appear on, album by album -- ArtistIds rather than
+        # AlbumArtistIds, so a guest spot counts too.
+        tracks = fetch_tracks(
+            config,
+            {"ArtistIds": args.artist, "SortBy": "Album,ParentIndexNumber,IndexNumber"},
+        )
+    elif args.search:
+        tracks = fetch_tracks(
+            config,
+            {"SearchTerm": args.search, "SortBy": "SortName", "Limit": SEARCH_PLAY_LIMIT},
+        )
+    elif args.item:
+        tracks = fetch_tracks(config, {"Ids": args.item})
+    elif args.favorites:
+        tracks = fetch_tracks(
+            config,
+            {"Filters": "IsFavorite", "SortBy": "Random" if args.shuffle else "Album,ParentIndexNumber,IndexNumber"},
+        )
+    elif args.shuffle:
+        tracks = fetch_tracks(config, {"SortBy": "Random", "Limit": args.limit})
+    else:
+        # Bare `play` resumes whatever is loaded rather than surprising the user
+        # with a fresh queue.
+        queued = read_queue()
+        if not queued:
+            raise JellyfinError("Nothing queued. Try: omarchy-jellyfin play --shuffle")
+        if mpv_running():
+            mpv_command("set_property", "pause", False)
+            return
+        # A queue file with no mpv behind it means the player died mid-session.
+        # Unpausing a freshly started idle mpv would play nothing and print
+        # nothing, so the queue is reloaded instead -- from the top, because
+        # the position did not survive the crash.
+        enqueue(config, queued)
+        print("Reloaded %d track%s." % (len(queued), "" if len(queued) == 1 else "s"))
+        return
+
+    if args.shuffle and not args.favorites:
+        random.shuffle(tracks)
+
+    enqueue(config, tracks, start_id=args.start)
+    print("Queued %d track%s." % (len(tracks), "" if len(tracks) == 1 else "s"))
+
+
+def cmd_volume(args):
+    # The live value wins when mpv is up, so a level changed by any other means
+    # is the one we step from. A silent mpv answers None, which is the same
+    # answer a missing one gives -- no need to ask whether it is there first.
+    current = mpv_get("volume")
+    if current is None:
+        current = stored_volume()
+
+    level = resolve_volume(current, args.level, args.step)
+    if args.level is not None:
+        mpv_command("set_property", "volume", level)
+        persist_volume(level)
+
+    if args.json:
+        print(json.dumps({"volume": level}))
+    else:
+        print("%d%%" % level)
+
+
+def cmd_seek(args):
+    if not mpv_running():
+        raise JellyfinError("Nothing is playing.")
+    mpv_command("seek", max(0, args.position), "absolute")
+
+
+def cmd_queue(args):
+    tracks = read_queue()
+    index = mpv_get("playlist-pos")
+    index = index if isinstance(index, int) else -1
+    if args.json:
+        print(json.dumps({"index": index, "tracks": tracks}))
+        return
+    for position, track in enumerate(tracks):
+        marker = ">" if position == index else " "
+        print("%s %2d  %s - %s" % (marker, position + 1, track["artist"] or "?", track["title"]))
+
+
+def cmd_jump(args):
+    if not mpv_running():
+        raise JellyfinError("Nothing is playing.")
+    mpv_command("playlist-play-index", max(0, args.index))
+    mpv_command("set_property", "pause", False)
+
+
+def cmd_toggle(_args):
+    if not mpv_running():
+        raise JellyfinError("Nothing is playing.")
+    mpv_command("cycle", "pause")
+
+
+def cmd_next(_args):
+    if not mpv_running():
+        raise JellyfinError("Nothing is playing.")
+    mpv_command("playlist-next", "force")
+
+
+def cmd_prev(_args):
+    if not mpv_running():
+        raise JellyfinError("Nothing is playing.")
+    mpv_command("playlist-prev", "force")
+
+
+def cmd_stop(_args):
+    mpv_command("quit")
+    try:
+        os.unlink(QUEUE_PATH)
+    except FileNotFoundError:
+        pass
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="omarchy-jellyfin",
+        description="Control Jellyfin music playback from the Omarchy bar.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    login = sub.add_parser("login", help="authenticate against a Jellyfin server")
+    login.add_argument(
+        "--server",
+        help="address of the server, local or remote. Omit to search this network first.",
+    )
+    login.add_argument("--user")
+    login.add_argument(
+        "--password",
+        help="not recommended: argv is readable by other users on this machine. "
+        "Prefer --password-stdin, or the interactive prompt.",
+    )
+    login.add_argument(
+        "--password-stdin",
+        action="store_true",
+        help="read the password from stdin, keeping it out of argv",
+    )
+    login.add_argument("--json", action="store_true")
+    login.add_argument(
+        "--insecure",
+        action="store_true",
+        help="accept a self-signed TLS certificate, as home servers often use",
+    )
+    login.set_defaults(func=cmd_login)
+
+    sub.add_parser("logout", help="forget stored credentials").set_defaults(func=cmd_logout)
+
+    server = sub.add_parser("server", help="show which server is configured")
+    server.add_argument("--json", action="store_true")
+    server.set_defaults(func=cmd_server)
+
+    discover = sub.add_parser("discover", help="find Jellyfin servers on this network")
+    discover.add_argument("--json", action="store_true")
+    discover.set_defaults(func=cmd_discover)
+
+    status = sub.add_parser("status", help="what is playing right now")
+    status.add_argument("--json", action="store_true")
+    status.set_defaults(func=cmd_status)
+
+    playlists = sub.add_parser("playlists", help="list music playlists")
+    playlists.add_argument("--json", action="store_true")
+    playlists.set_defaults(func=cmd_playlists)
+
+    favorites = sub.add_parser("favorites", help="list favorite tracks")
+    favorites.add_argument("--json", action="store_true")
+    favorites.set_defaults(func=cmd_favorites)
+
+    artists = sub.add_parser("artists", help="list every artist in the library")
+    artists.add_argument("--limit", type=int, default=BROWSE_LIMIT)
+    artists.add_argument("--json", action="store_true")
+    artists.set_defaults(func=cmd_artists)
+
+    albums = sub.add_parser("albums", help="list albums, all of them or one artist's")
+    albums.add_argument("--artist", help="artist id: their discography, oldest first")
+    albums.add_argument("--limit", type=int, default=BROWSE_LIMIT)
+    albums.add_argument("--json", action="store_true")
+    albums.set_defaults(func=cmd_albums)
+
+    tracks = sub.add_parser("tracks", help="list the tracks of an album or a playlist")
+    tracks_source = tracks.add_mutually_exclusive_group(required=True)
+    tracks_source.add_argument("--album", help="album id")
+    tracks_source.add_argument("--playlist", help="playlist id")
+    tracks.add_argument("--json", action="store_true")
+    tracks.set_defaults(func=cmd_tracks)
+
+    search = sub.add_parser("search", help="search artists, albums and tracks")
+    search.add_argument("query")
+    search.add_argument("--json", action="store_true")
+    search.set_defaults(func=cmd_search)
+
+    play = sub.add_parser("play", help="start playback")
+    play.add_argument("--playlist", help="playlist id")
+    play.add_argument("--album", help="album id")
+    play.add_argument("--artist", help="artist id: everything they appear on")
+    play.add_argument("--search", help="queue what a search matches")
+    play.add_argument("--item", help="single track id")
+    play.add_argument("--favorites", action="store_true")
+    play.add_argument("--shuffle", action="store_true")
+    play.add_argument("--start", help="track id to start on, queuing the rest around it")
+    play.add_argument("--limit", type=int, default=200, help="how many tracks Shuffle all pulls")
+    play.set_defaults(func=cmd_play)
+
+    volume = sub.add_parser("volume", help="show or change the playback volume")
+    volume.add_argument(
+        "level",
+        nargs="?",
+        help="a level such as 60, or 'up' / 'down'. Omit to just print the current one.",
+    )
+    volume.add_argument("--step", type=int, default=5, help="how much up/down moves")
+    volume.add_argument("--json", action="store_true")
+    volume.set_defaults(func=cmd_volume)
+
+    seek = sub.add_parser("seek", help="jump to a position in the current track")
+    seek.add_argument("position", type=float, help="seconds from the start")
+    seek.set_defaults(func=cmd_seek)
+
+    queue = sub.add_parser("queue", help="show the current queue")
+    queue.add_argument("--json", action="store_true")
+    queue.set_defaults(func=cmd_queue)
+
+    jump = sub.add_parser("jump", help="play a given position in the queue")
+    jump.add_argument("index", type=int, help="0-based queue index")
+    jump.set_defaults(func=cmd_jump)
+
+    sub.add_parser("toggle", help="play/pause").set_defaults(func=cmd_toggle)
+    sub.add_parser("next", help="next track").set_defaults(func=cmd_next)
+    sub.add_parser("prev", help="previous track").set_defaults(func=cmd_prev)
+    sub.add_parser("stop", help="stop playback and quit mpv").set_defaults(func=cmd_stop)
+
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        args.func(args)
+    except JellyfinError as exc:
+        print("omarchy-jellyfin: %s" % exc, file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        # The widget prints stderr verbatim into its panel, so an unexpected
+        # failure has to arrive as a sentence. Set OMARCHY_JELLYFIN_DEBUG to
+        # get the traceback back when that sentence is not enough.
+        if os.environ.get("OMARCHY_JELLYFIN_DEBUG"):
+            raise
+        print(
+            "omarchy-jellyfin: unexpected error: %s: %s\n"
+            "  Re-run with OMARCHY_JELLYFIN_DEBUG=1 for the full traceback."
+            % (type(exc).__name__, exc),
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

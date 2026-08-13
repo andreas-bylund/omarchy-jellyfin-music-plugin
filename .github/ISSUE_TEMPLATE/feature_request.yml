@@ -1,0 +1,35 @@
+name: Feature request
+description: Something the plugin does not do yet.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Worth knowing what is deliberately absent before you write: casting to
+        other Jellyfin clients, and browsing by anything other than playlists,
+        favourites, artists and albums. Those are listed under **Limitations** in
+        the README. Making a case for one of them is fair — just say so, so the
+        answer is not simply a link back to that list.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do
+      description: The thing you wanted to get done, rather than the feature you have in mind for it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you think would solve it
+    validations:
+      required: false
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: How you handle it today
+      description: The CLI reaches further than the popup does, so there is often something.
+    validations:
+      required: false

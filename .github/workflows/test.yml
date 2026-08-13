@@ -1,0 +1,34 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Nothing here writes to the repo, so the token that runs it should not be
+# able to either.
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Manifest is valid JSON and declares its entry point
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          m = json.load(open("manifest.json"))
+          for key in ("schemaVersion", "id", "name", "version", "kinds", "entryPoints"):
+              assert key in m, "manifest is missing %s" % key
+          assert m["schemaVersion"] == 1, "unsupported schemaVersion"
+          for kind, path in m["entryPoints"].items():
+              assert os.path.isfile(path), "entry point %s missing: %s" % (kind, path)
+          print("manifest ok:", m["id"], m["version"])
+          PY

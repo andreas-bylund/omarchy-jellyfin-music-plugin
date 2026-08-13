@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "id": "andreasbylund.jellyfin",
+  "name": "Jellyfin Music",
+  "version": "0.1.0",
+  "author": "Andreas Bylund",
+  "license": "MIT",
+  "description": "Play music from your Jellyfin server straight from the Omarchy bar, through mpv.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Jellyfin Music",
+    "description": "Now playing, transport controls, and quick picks from your Jellyfin music library. Streams to a local mpv, so the track also appears on MPRIS and the media keys work.",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "shuffleLimit": 200,
+      "showAlbumArt": true,
+      "barTitleWidth": 110,
+      "scrollBarTitle": true,
+      "showBarTitle": true
+    },
+    "schema": [
+      {
+        "key": "showBarTitle",
+        "type": "boolean",
+        "label": "Show the track title in the bar",
+        "defaultValue": true,
+        "description": "Off leaves just the music icon. Also toggleable from the gear inside the panel."
+      },
+      {
+        "key": "scrollBarTitle",
+        "type": "boolean",
+        "label": "Scroll the title in the bar",
+        "defaultValue": true,
+        "description": "Off holds a long title still and shortens it instead. Also toggleable from the gear inside the panel."
+      },
+      {
+        "key": "barTitleWidth",
+        "type": "integer",
+        "label": "Track title width in the bar",
+        "min": 40,
+        "max": 300,
+        "step": 10,
+        "defaultValue": 110,
+        "description": "How much room the title gets next to the icon. Use the toggle above to turn it off entirely."
+      },
+      {
+        "key": "showAlbumArt",
+        "type": "boolean",
+        "label": "Show album art",
+        "defaultValue": true,
+        "description": "Cover image next to the current track. Also toggleable from the gear inside the panel."
+      },
+      {
+        "key": "shuffleLimit",
+        "type": "integer",
+        "label": "Tracks pulled by Shuffle all",
+        "min": 20,
+        "max": 500,
+        "step": 20,
+        "defaultValue": 200
+      }
+    ]
+  }
+}
