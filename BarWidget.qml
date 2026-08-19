@@ -20,12 +20,9 @@ Panel {
   readonly property string cli: decodeURIComponent(
     Qt.resolvedUrl("bin/omarchy-jellyfin").toString().replace(/^file:\/\//, ""))
 
-  // The bar entry is the icon plus the current track title. The title is a
-  // setting rather than a given because Omarchy's own omarchy.media widget
-  // already shows it over MPRIS, where mpv publishes -- run both and the bar
-  // says the same thing twice, so anyone who does turns this one off.
-  // Both dimensions follow the button, which sizes itself from whichever of
-  // the two it is currently drawing.
+  // The bar entry is just the icon. Omarchy's own omarchy.media widget
+  // already shows the track title over MPRIS, where mpv publishes -- so this
+  // one stays out of its way rather than saying the same thing twice.
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
@@ -45,7 +42,6 @@ Panel {
   // open in place: right goes a level in, left comes back out.
   readonly property string glyphOpen: String.fromCodePoint(0xF0142)
   readonly property string glyphBack: String.fromCodePoint(0xF0141)
-  readonly property string glyphCog: String.fromCodePoint(0xF0493)
   readonly property string glyphVolume: String.fromCodePoint(0xF057E)
   readonly property string glyphVolumeLow: String.fromCodePoint(0xF057F)
   readonly property string glyphVolumeOff: String.fromCodePoint(0xF0581)
@@ -71,15 +67,9 @@ Panel {
   property var pendingLevel: null
   property int queueIndex: -1
   property bool loadingRows: false
-  property bool settingsOpen: false
-  property bool switchingServer: false
   property bool loggingIn: false
-  property bool searching: false
   property bool cursorActive: false
   property int rowIndex: 0
-  // What answered the discovery broadcast. Shown as a list to pick from,
-  // never filled in on your behalf -- see discoverProc.
-  property var discovered: []
 
   // Library search. The query lives here rather than being read off the field
   // so everything downstream -- the rows, the play command, the placeholder --
@@ -122,17 +112,14 @@ Panel {
     : (playback && playback.volume !== undefined ? playback.volume : 70)
 
   readonly property bool barVertical: bar ? bar.vertical === true : false
-  // Title only. Appending the artist doubles the width of a bar that already
-  // carries nine other widgets; the artist is a hover away in the tooltip.
-  readonly property string barTitle: track ? track.title : ""
 
   readonly property var track: playback && playback.track ? playback.track : null
   readonly property bool playing: playback ? playback.playing === true : false
   readonly property bool paused: playback ? playback.paused === true : false
   readonly property bool loggedIn: account && account.configured === true
-  readonly property bool showArt: setting("showAlbumArt", true)
-  readonly property bool showBarTitle: setting("showBarTitle", true)
-  readonly property bool scrollTitle: setting("scrollBarTitle", true)
+  // Always on: cover art is worth the space, and there is no settings screen
+  // left to turn it off from.
+  readonly property bool showArt: true
 
   readonly property string tooltip: {
     if (!loggedIn) return "Jellyfin Music — not connected"
@@ -527,43 +514,6 @@ Panel {
     loginProc.running = true
   }
 
-  function beginSwitchServer() {
-    switchingServer = true
-    notice = ""
-    discovered = []
-    // The old server is a sensible starting point for editing, but the old
-    // account is not: signing in as someone else is half of why you are here.
-    serverField.text = account.server || ""
-    userField.text = ""
-    passwordField.text = ""
-    // The field is only just becoming visible; focusing it in the same pass
-    // would land on an item that is not on screen yet.
-    Qt.callLater(function() { userField.forceActiveFocus() })
-  }
-
-  function cancelSwitchServer() {
-    switchingServer = false
-    notice = ""
-    discovered = []
-    passwordField.text = ""
-    serverField.text = account.server || ""
-  }
-
-  function searchNetwork() {
-    if (discoverProc.running) return
-    notice = ""
-    discovered = []
-    searching = true
-    discoverProc.running = true
-  }
-
-  // Widget settings live in shell.json, which the shell owns; `omarchy bar set`
-  // is the supported way in, and the change comes back to us as `settings`.
-  function persist(key, value) {
-    if (!bar) return
-    bar.run("omarchy bar set " + moduleName + " " + key + " " + value + " --json")
-  }
-
   function cleanError(text) {
     return String(text || "").replace("omarchy-jellyfin: ", "").trim()
   }
@@ -593,9 +543,6 @@ Panel {
       try {
         root.account = JSON.parse(String(accountOut.text || "").trim())
         if (root.account.server && serverField.text === "") serverField.text = root.account.server
-        // With no account there is nothing else the panel can usefully show,
-        // so it opens straight into the form rather than an empty shell.
-        if (!root.loggedIn && root.opened) root.settingsOpen = true
       } catch (e) {
       }
     }
@@ -620,32 +567,7 @@ Panel {
         return
       }
       root.notice = ""
-      root.settingsOpen = false
-      root.switchingServer = false
       root.refreshAccount()
-    }
-  }
-
-  Process {
-    id: discoverProc
-    running: false
-    command: [root.cli, "discover", "--json"]
-    stdout: StdioCollector { id: discoverOut; waitForEnd: true }
-    onExited: function(exitCode) {
-      root.searching = false
-      var found = []
-      try {
-        found = JSON.parse(String(discoverOut.text || "").trim()) || []
-      } catch (e) {
-      }
-      // Deliberately not filled in for you, not even when only one server
-      // answered. Discovery is an unauthenticated broadcast: anything on the
-      // network can claim to be a Jellyfin, and the next thing typed into
-      // this form is a password. So the replies are listed with their names
-      // and picking one is a decision you make.
-      root.discovered = found
-      if (found.length === 0)
-        root.notice = "No servers answered on this network. Type the address instead."
     }
   }
 
@@ -817,9 +739,6 @@ Panel {
       rootQuery = ""
       queueIndex = -1
       notice = ""
-      settingsOpen = false
-      switchingServer = false
-      discovered = []
       passwordField.text = ""
       // Opening the panel again is usually a glance at what is playing, not a
       // return to the search you left behind.
@@ -827,9 +746,9 @@ Panel {
     }
   }
 
-  // Icon plus the running title, the way omarchy.media does it. Built on
-  // WidgetButton rather than BarIconButton because that one is fixed to a
-  // single icon slot and cannot carry a label.
+  // Icon only, the way a bar-slot widget with nothing to label should be.
+  // Built on WidgetButton rather than BarIconButton because that one is fixed
+  // to a single icon slot and this still sizes itself off its own content.
   WidgetButton {
     id: button
     bar: root.bar
@@ -854,7 +773,6 @@ Panel {
     Row {
       id: barContent
       anchors.centerIn: parent
-      spacing: barLabelClip.visible ? Style.space(6) : 0
 
       Text {
         id: barGlyph
@@ -863,51 +781,6 @@ Panel {
         color: button.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.icon
-      }
-
-      Item {
-        id: barLabelClip
-        anchors.verticalCenter: parent.verticalCenter
-        // A vertical bar has no room, and a width of 0 from an older config
-        // still means off even though the toggle owns that now.
-        visible: root.showBarTitle && !root.barVertical && root.barTitle !== ""
-          && root.setting("barTitleWidth", 110) > 0
-        width: Math.min(Style.space(root.setting("barTitleWidth", 110)), barLabel.implicitWidth)
-        height: barGlyph.height
-        clip: true
-
-        Text {
-          id: barLabel
-          anchors.verticalCenter: parent.verticalCenter
-          text: root.barTitle
-          color: button.foreground
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.body
-          // Standing still, a long title is cut off mid-word unless it is
-          // given a width to elide against.
-          width: scrolling ? implicitWidth : barLabelClip.width
-          elide: scrolling ? Text.ElideNone : Text.ElideRight
-
-          readonly property bool needsScroll: implicitWidth > barLabelClip.width
-          // Motion in the corner of the eye is not for everyone, so it is a
-          // setting. It also pauses while the panel is open, where the full
-          // title is already on screen.
-          readonly property bool scrolling: needsScroll && root.scrollTitle
-            && !root.opened && !root.barVertical
-
-          // The animation writes x directly, so stopping it leaves the label
-          // wherever it happened to be. Put it back.
-          onScrollingChanged: if (!scrolling) x = 0
-
-          NumberAnimation on x {
-            running: barLabel.scrolling
-            loops: Animation.Infinite
-            duration: Math.max(6000, barLabel.implicitWidth * 25)
-            from: barLabelClip.width
-            to: -barLabel.implicitWidth
-            easing.type: Easing.Linear
-          }
-        }
       }
     }
   }
@@ -927,7 +800,7 @@ Panel {
       anchors.fill: parent
       // A text field owns the keyboard while it has focus, or typing a
       // password -- or a band name -- would trigger playback shortcuts.
-      blocked: root.settingsOpen || searchField.activeFocus
+      blocked: !root.loggedIn || searchField.activeFocus
       // Sideways walks the library the way the chevrons do: right opens what
       // the cursor is on, left steps back out of the level you are in.
       onMoveRequested: function(dx, dy) {
@@ -955,8 +828,6 @@ Panel {
         else if (t === "-" || t === "_") root.stepVolume(-1)
         // "/" for search, the way a pager or a browser does it.
         else if (t === "/") searchField.forceActiveFocus()
-        // "," for settings, the way most apps do it.
-        else if (t === ",") { root.settingsOpen = !root.settingsOpen; root.notice = "" }
       }
 
       Flickable {
@@ -975,285 +846,61 @@ Panel {
           width: panelFlick.width
           spacing: Style.space(10)
 
-          // The gear rides in the top-right of whichever block is showing,
-          // rather than owning a header row of its own. The connection details
-          // it used to sit next to are plumbing you need once, so they moved
-          // inside the settings block.
-          Component {
-            id: cogButton
-
-            Text {
-              text: root.glyphCog
-              color: (root.settingsOpen || cogArea.containsMouse) ? root.foreground : root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-
-              MouseArea {
-                id: cogArea
-                anchors.fill: parent
-                anchors.margins: -Style.space(6)
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: {
-                  root.settingsOpen = !root.settingsOpen
-                  root.notice = ""
-                }
-              }
-            }
-          }
-
-          // Settings. Replaces the body rather than folding out below it:
-          // nothing in the playback half is worth looking at while you are
-          // deciding which server to talk to.
+          // Connect. There is nothing else the panel can usefully do before
+          // an account exists, so this is the whole of it -- no server
+          // switching or log-out from here once signed in.
           Column {
             width: parent.width
-            visible: root.settingsOpen
+            visible: !root.loggedIn
             spacing: Style.space(8)
 
-            Item {
+            Text {
               width: parent.width
-              implicitHeight: Math.max(settingsHeading.implicitHeight, settingsCog.implicitHeight)
-
-              Column {
-                id: settingsHeading
-                anchors.left: parent.left
-                anchors.right: settingsCog.left
-                anchors.rightMargin: Style.space(6)
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.space(1)
-
-                Text {
-                  width: parent.width
-                  text: root.loggedIn ? "Connection" : "Connect to Jellyfin"
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.subtitle
-                }
-
-                Text {
-                  width: parent.width
-                  visible: root.loggedIn
-                  text: root.loggedIn
-                    ? "Signed in as " + root.account.userName + " · "
-                      + root.account.server.replace(/^https?:\/\//, "")
-                    : ""
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  elide: Text.ElideRight
-                }
-              }
-
-              Loader {
-                id: settingsCog
-                anchors.right: parent.right
-                anchors.top: parent.top
-                sourceComponent: cogButton
-              }
+              text: "Connect to Jellyfin"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.subtitle
             }
 
-            // The form appears only when it can actually do something. Under a
-            // live connection an empty username and password box is noise, and
-            // the button above them could only ever fail on the empty fields.
-            Column {
+            TextField {
+              id: serverField
               width: parent.width
-              visible: !root.loggedIn || root.switchingServer
-              spacing: Style.space(8)
-
-              TextField {
-                id: serverField
-                width: parent.width
-                foreground: root.foreground
-                placeholderText: "192.168.1.50:8096 or jellyfin.example.com"
-                onAccepted: userField.forceActiveFocus()
-              }
-
-              Row {
-                width: parent.width
-                spacing: Style.space(8)
-
-                Button {
-                  text: root.searching ? "Searching…" : "Search network"
-                  enabled: !root.searching
-                  foreground: root.foreground
-                  fontFamily: root.fontFamily
-                  bordered: true
-                  onClicked: root.searchNetwork()
-                }
-              }
-
-              // What answered the broadcast. Anything on the network can
-              // answer, so the name is shown next to the address and the
-              // choice stays with the person about to type a password.
-              Column {
-                width: parent.width
-                visible: root.discovered.length > 0
-                spacing: Style.space(1)
-
-                Text {
-                  width: parent.width
-                  text: "Answered on this network — check the name before picking one:"
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  wrapMode: Text.WordWrap
-                }
-
-                Repeater {
-                  model: root.discovered
-
-                  Item {
-                    required property var modelData
-                    width: parent.width
-                    implicitHeight: Style.space(20)
-
-                    Rectangle {
-                      anchors.fill: parent
-                      anchors.margins: -Style.space(2)
-                      radius: Style.space(4)
-                      visible: foundArea.containsMouse
-                      color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.10)
-                    }
-
-                    Text {
-                      anchors.left: parent.left
-                      anchors.right: parent.right
-                      anchors.verticalCenter: parent.verticalCenter
-                      text: modelData.name + "  ·  " + modelData.address
-                      color: root.foreground
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.bodySmall
-                      elide: Text.ElideRight
-                    }
-
-                    MouseArea {
-                      id: foundArea
-                      anchors.fill: parent
-                      hoverEnabled: true
-                      cursorShape: Qt.PointingHandCursor
-                      onClicked: {
-                        serverField.text = modelData.address
-                        root.discovered = []
-                        userField.forceActiveFocus()
-                      }
-                    }
-                  }
-                }
-              }
-
-              TextField {
-                id: userField
-                width: parent.width
-                foreground: root.foreground
-                placeholderText: "Username"
-                onAccepted: passwordField.forceActiveFocus()
-              }
-
-              TextField {
-                id: passwordField
-                width: parent.width
-                foreground: root.foreground
-                password: true
-                placeholderText: "Password"
-                onAccepted: root.logIn()
-              }
-
-              Row {
-                width: parent.width
-                spacing: Style.space(8)
-
-                Button {
-                  text: root.loggingIn ? "Connecting…" : "Log in"
-                  enabled: !root.loggingIn
-                  foreground: root.foreground
-                  fontFamily: root.fontFamily
-                  bordered: true
-                  onClicked: root.logIn()
-                }
-
-                Button {
-                  visible: root.switchingServer
-                  text: "Cancel"
-                  foreground: root.foreground
-                  fontFamily: root.fontFamily
-                  bordered: true
-                  onClicked: root.cancelSwitchServer()
-                }
-              }
+              foreground: root.foreground
+              placeholderText: "192.168.1.50:8096 or jellyfin.example.com"
+              onAccepted: userField.forceActiveFocus()
             }
 
-            // Connected: the two things you might actually want, and nothing
-            // to fill in.
-            Row {
+            TextField {
+              id: userField
               width: parent.width
-              visible: root.loggedIn && !root.switchingServer
-              spacing: Style.space(8)
-
-              Button {
-                text: "Switch server…"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                bordered: true
-                onClicked: root.beginSwitchServer()
-              }
-
-              Button {
-                text: "Log out"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                bordered: true
-                // The account refresh happens when the logout has finished,
-                // from actionProc.onExited -- not here, where it would race
-                // the revocation call and read the config it is deleting.
-                onClicked: root.send(["logout"])
-              }
+              foreground: root.foreground
+              placeholderText: "Username"
+              onAccepted: passwordField.forceActiveFocus()
             }
 
-            Rectangle {
+            TextField {
+              id: passwordField
               width: parent.width
-              height: Style.spacing.hairline
-              color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.18)
+              foreground: root.foreground
+              password: true
+              placeholderText: "Password"
+              onAccepted: root.logIn()
             }
 
-            Toggle {
-              width: parent.width
-              label: "Show album art"
-              description: "Cover image next to the current track"
-              checked: root.showArt
+            Button {
+              text: root.loggingIn ? "Connecting…" : "Log in"
+              enabled: !root.loggingIn
               foreground: root.foreground
               fontFamily: root.fontFamily
-              onClicked: root.persist("showAlbumArt", root.showArt ? "false" : "true")
-            }
-
-            Toggle {
-              width: parent.width
-              label: "Show the track title in the bar"
-              description: "Off leaves just the music icon"
-              checked: root.showBarTitle
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              onClicked: root.persist("showBarTitle", root.showBarTitle ? "false" : "true")
-            }
-
-            Toggle {
-              width: parent.width
-              // Nothing to scroll when there is no title, so the choice is
-              // hidden rather than left there doing nothing.
-              visible: root.showBarTitle
-              label: "Scroll the title in the bar"
-              description: "Off holds a long title still and shortens it instead"
-              checked: root.scrollTitle
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              onClicked: root.persist("scrollBarTitle", root.scrollTitle ? "false" : "true")
+              bordered: true
+              onClicked: root.logIn()
             }
           }
 
-          // Now playing. The gear rides top-right here so the connection
-          // details no longer take the line your eye lands on first.
+          // Now playing.
           Item {
             width: parent.width
-            visible: !root.settingsOpen
+            visible: root.loggedIn
             implicitHeight: Math.max(artFrame.height, nowInfo.implicitHeight)
 
             Rectangle {
@@ -1290,18 +937,11 @@ Panel {
               }
             }
 
-            Loader {
-              id: bodyCog
-              anchors.right: parent.right
-              anchors.top: parent.top
-              sourceComponent: cogButton
-            }
-
             Column {
               id: nowInfo
               anchors.left: artFrame.visible ? artFrame.right : parent.left
               anchors.leftMargin: artFrame.visible ? Style.space(10) : 0
-              anchors.right: bodyCog.left
+              anchors.right: parent.right
               anchors.rightMargin: Style.space(8)
               anchors.top: parent.top
               spacing: Style.space(2)
@@ -1343,7 +983,7 @@ Panel {
           // a control.
           Item {
             width: parent.width
-            visible: root.track !== null && !root.settingsOpen
+            visible: root.track !== null
             implicitHeight: seekSlider.implicitHeight + elapsedLabel.implicitHeight + Style.space(2)
 
             PanelSlider {
@@ -1386,7 +1026,7 @@ Panel {
           // the player half taller than the library half for no good reason.
           Item {
             width: parent.width
-            visible: !root.settingsOpen
+            visible: root.loggedIn
             implicitHeight: Math.max(transport.implicitHeight, volumeSlider.implicitHeight)
 
             Row {
@@ -1459,7 +1099,7 @@ Panel {
 
           Rectangle {
             width: parent.width
-            visible: !root.settingsOpen
+            visible: root.loggedIn
             height: Style.spacing.hairline
             color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.18)
           }
@@ -1469,7 +1109,7 @@ Panel {
           // when you already know what you are in the mood for.
           Item {
             width: parent.width
-            visible: root.loggedIn && !root.settingsOpen
+            visible: root.loggedIn
             implicitHeight: searchField.implicitHeight
 
             TextField {
@@ -1558,7 +1198,7 @@ Panel {
           // Quick picks, plus whichever section is folded open.
           Column {
             width: parent.width
-            visible: !root.settingsOpen
+            visible: root.loggedIn
             spacing: Style.space(1)
 
             Repeater {

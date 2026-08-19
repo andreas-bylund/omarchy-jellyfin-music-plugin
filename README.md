@@ -111,21 +111,12 @@ In the bar:
 Scroll adjusts volume rather than skipping tracks, because it is the thing you
 reach for mid-song and it works without opening the popup.
 
-The bar entry shows the icon plus the current track title, scrolling when it
-does not fit.
+The bar entry is just the icon — Omarchy's own media widget already shows the
+track title over MPRIS, so this one stays out of its way rather than saying
+the same thing twice.
 
 <img src="docs/images/bar.png" width="560"
-     alt="The Omarchy bar, with the music icon and the scrolling track title sitting among the other bar widgets.">
-
-Three settings cover that, in decreasing order of how much you are likely to
-care:
-
-- **Show the track title in the bar** — off leaves just the music icon, for a
-  bar that is already full or an eye that would rather not read one.
-- **Scroll the title in the bar** — off holds a long title still and shortens
-  it with an ellipsis instead. Motion in the corner of the eye is not for
-  everyone.
-- **Track title width in the bar** — how much room the title gets.
+     alt="The Omarchy bar, with the music icon sitting among the other bar widgets.">
 
 The popup carries, top to bottom: cover art with title, artist and album; a
 draggable seek bar with elapsed and total time; transport and volume on one row;
@@ -196,19 +187,14 @@ that is in between.
 
 In the popup, `j`/`k` move, `l`/`→` opens a row, `h`/`←` goes back, `Enter`
 plays or opens, `space` toggles playback, `n` and `p` skip, `+`/`-` change volume, `s`
-shuffles the library, `/` searches, and `,` opens settings.
+shuffles the library, and `/` searches.
 
-The gear holds the settings and the connection. Once you are connected that
-part is just who you are signed in as, with **Switch server…** and **Log out** —
-the address, username and password boxes only appear when there is something to
-fill in.
-
-<img src="docs/images/settings.png" width="400"
-     alt="The gear panel: a Connection block naming the signed-in user and server with Switch server and Log out beside it, then toggles for album art, the bar title, and scrolling that title.">
-
-The three toggles here are the ones worth reaching for while the music is in
-front of you. The rest — the title's width, and how much `Shuffle all` pulls —
-live in Omarchy's plugin settings, where you set them once.
+There is no settings screen: album art is always shown, the bar stays
+icon-only, and everything else is a sensible default. The one knob left — how
+many tracks `Shuffle all` pulls — lives in Omarchy's own plugin settings.
+The popup still asks for a server, username and password when nothing is
+signed in yet, but once connected there is no in-popup way to switch servers
+or log out — that is a CLI call (`login` again, or `logout`).
 
 ## Volume
 
