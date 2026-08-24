@@ -195,8 +195,8 @@ a name and pressing `Enter` twice still queues the lot — with a look at what
 that is in between.
 
 In the popup, `j`/`k` move, `l`/`→` opens a row, `h`/`←` goes back, `Enter`
-plays or opens, `space` toggles playback, `n` and `p` skip, `+`/`-` change volume, `s`
-shuffles the library, `/` searches, and `,` opens settings.
+plays or opens, `space` toggles playback, `n` and `p` skip, `f` toggles the heart on the
+current track, `+`/`-` change volume, `s` shuffles the library, `/` searches, and `,` opens settings.
 
 The gear holds the settings and the connection. Once you are connected that
 part is just who you are signed in as, with **Switch server…** and **Log out** —
@@ -250,13 +250,15 @@ omarchy-jellyfin volume                  # print the level
 omarchy-jellyfin volume 55               # set it
 omarchy-jellyfin volume up --step 10     # or nudge it
 omarchy-jellyfin toggle | next | prev | stop
+omarchy-jellyfin favorite <item-id> favorite     # mark as favorite
+omarchy-jellyfin favorite <item-id> unfavorite   # remove favorite
 ```
 
 <img src="docs/images/cli.png" width="720"
      alt="A terminal running omarchy-jellyfin status, queue, search and albums: the playing track marked in the queue, and the listing commands printing an id, a name and a detail per row.">
 
-Add `--json` to `status`, `volume`, `queue`, `playlists`, `favorites`, `search`,
-`artists`, `albums`, and `tracks` for machine output. The listing commands share
+Add `--json` to `status`, `volume`, `queue`, `favorite`, `playlists`, `favorites`,
+`search`, `artists`, `albums`, and `tracks` for machine output. The listing commands share
 one row shape — `{id, name, detail}` — because what they list differs but what
 you do with it next does not.
 

@@ -950,6 +950,7 @@ Panel {
         if (t === " ") root.send(["toggle"])
         else if (t === "n") root.send(["next"])
         else if (t === "p") root.send(["prev"])
+        else if (t === "f" && root.track) root.send(["favorite", root.track.id, root.track.favorite ? "unfavorite" : "favorite"])
         else if (t === "s") root.send(["play", "--shuffle", "--limit", String(root.setting("shuffleLimit", 200))])
         else if (t === "+" || t === "=") root.stepVolume(1)
         else if (t === "-" || t === "_") root.stepVolume(-1)
@@ -1306,13 +1307,38 @@ Panel {
               anchors.top: parent.top
               spacing: Style.space(2)
 
-              Text {
+              Row {
                 width: parent.width
-                text: root.track ? root.track.title : (root.loggedIn ? "Nothing playing" : "Connect a server to start")
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.subtitle
-                elide: Text.ElideRight
+                spacing: Style.space(6)
+
+                Text {
+                  id: titleText
+                  width: parent.width - (root.track ? favoriteButton.implicitWidth + parent.spacing : 0)
+                  text: root.track ? root.track.title : (root.loggedIn ? "Nothing playing" : "Connect a server to start")
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.subtitle
+                  elide: Text.ElideRight
+                }
+
+                Text {
+                  id: favoriteButton
+                  visible: root.track !== null
+                  text: root.track && root.track.favorite ? root.glyphHeart : "\u2665"
+                  color: favoriteArea.containsMouse || (root.track && root.track.favorite)
+                    ? root.foreground : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+
+                  MouseArea {
+                    id: favoriteArea
+                    anchors.fill: parent
+                    anchors.margins: -Style.space(4)
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.send(["favorite", root.track.id, root.track.favorite ? "unfavorite" : "favorite"])
+                  }
+                }
               }
 
               Text {

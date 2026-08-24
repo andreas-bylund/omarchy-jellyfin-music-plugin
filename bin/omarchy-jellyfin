@@ -290,6 +290,7 @@ def track_from_item(item):
     artists = item.get("Artists") or []
     artist = ", ".join(artists) if artists else (item.get("AlbumArtist") or "")
     ticks = item.get("RunTimeTicks") or 0
+    user_data = item.get("UserData") or {}
     return {
         "id": item.get("Id", ""),
         "title": item.get("Name", "Unknown"),
@@ -300,6 +301,7 @@ def track_from_item(item):
         "artId": item.get("AlbumId") or item.get("Id", ""),
         # Jellyfin counts in 100ns ticks; everything downstream wants seconds.
         "duration": int(ticks / 10_000_000) if ticks else 0,
+        "favorite": bool(user_data.get("IsFavorite", False)),
     }
 
 
@@ -682,10 +684,14 @@ def api_get(config, path, params=None):
 
 
 def api_post(config, path, payload, unauthorized=None):
-    return _api_request(config, config["server"] + path, payload, unauthorized)
+    return _api_request(config, config["server"] + path, payload, unauthorized, method="POST")
 
 
-def _api_request(config, url, payload, unauthorized=None):
+def api_delete(config, path, unauthorized=None):
+    return _api_request(config, config["server"] + path, None, unauthorized, method="DELETE")
+
+
+def _api_request(config, url, payload, unauthorized=None, method=None):
     data = None
     headers = {
         "Authorization": auth_header(config.get("token"), config["deviceId"]),
@@ -695,7 +701,7 @@ def _api_request(config, url, payload, unauthorized=None):
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
 
-    request = urllib.request.Request(url, data=data, headers=headers)
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         context = ssl_context(config.get("insecure", False))
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT, context=context) as response:
@@ -1420,6 +1426,30 @@ def cmd_stop(_args):
         pass
 
 
+def cmd_favorite(args):
+    config = load_config()
+    item_id = args.item_id
+    favorite = args.action == "favorite"
+    endpoint = "/Users/%s/FavoriteItems/%s" % (config["userId"], item_id)
+
+    if favorite:
+        api_post(config, endpoint, {})
+    else:
+        api_delete(config, endpoint)
+
+    queue = read_queue()
+    for track in queue:
+        if track.get("id") == item_id:
+            track["favorite"] = favorite
+            break
+    write_queue(queue)
+
+    if args.json:
+        print(json.dumps({"favorite": favorite}))
+        return
+    print("Favorited." if favorite else "Unfavorited.")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="omarchy-jellyfin",
@@ -1533,6 +1563,15 @@ def build_parser():
     sub.add_parser("toggle", help="play/pause").set_defaults(func=cmd_toggle)
     sub.add_parser("next", help="next track").set_defaults(func=cmd_next)
     sub.add_parser("prev", help="previous track").set_defaults(func=cmd_prev)
+    favorite = sub.add_parser("favorite", help="favorite or unfavorite a track")
+    favorite.add_argument("item_id", help="Jellyfin item id of the track")
+    favorite.add_argument(
+        "action",
+        choices=("favorite", "unfavorite"),
+        help="whether to favorite or unfavorite the track",
+    )
+    favorite.add_argument("--json", action="store_true")
+    favorite.set_defaults(func=cmd_favorite)
     sub.add_parser("stop", help="stop playback and quit mpv").set_defaults(func=cmd_stop)
 
     return parser
