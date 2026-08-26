@@ -611,7 +611,7 @@ class FavoriteTest(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             jf.cmd_favorite(self._args("track1", "favorite"))
         self.assertEqual(self.calls, [
-            ("api_post", (self.CONFIG, "/Users/u/FavoriteItems/track1", {})),
+            ("api_post", (self.CONFIG, "/UserFavoriteItems/track1?userId=u", {})),
             ("write_queue", [{"id": "track1", "title": "One", "artist": "X", "favorite": True}]),
         ])
         self.assertIn("Favorited.", out.getvalue())
@@ -622,7 +622,7 @@ class FavoriteTest(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             jf.cmd_favorite(self._args("track1", "unfavorite"))
         self.assertEqual(self.calls, [
-            ("api_delete", (self.CONFIG, "/Users/u/FavoriteItems/track1")),
+            ("api_delete", (self.CONFIG, "/UserFavoriteItems/track1?userId=u")),
             ("write_queue", [{"id": "track1", "title": "One", "artist": "X", "favorite": False}]),
         ])
         self.assertIn("Unfavorited.", out.getvalue())
@@ -634,12 +634,22 @@ class FavoriteTest(unittest.TestCase):
             jf.cmd_favorite(self._args("track1", "favorite", json=True))
         self.assertEqual(json.loads(out.getvalue()), {"favorite": True})
 
-    def test_updates_queue_only_when_track_is_present(self):
+    def test_skips_queue_update_when_track_is_absent(self):
         self.patch("read_queue", lambda: [dict(self.TRACK)])
-        jf.cmd_favorite(self._args("missing", "favorite"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            jf.cmd_favorite(self._args("missing", "favorite"))
         self.assertEqual(self.calls, [
-            ("api_post", (self.CONFIG, "/Users/u/FavoriteItems/missing", {})),
-            ("write_queue", [dict(self.TRACK)]),
+            ("api_post", (self.CONFIG, "/UserFavoriteItems/missing?userId=u", {})),
+        ])
+
+    def test_quotes_item_id_in_path(self):
+        self.patch("read_queue", list)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            jf.cmd_favorite(self._args("a/b c", "favorite"))
+        self.assertEqual(self.calls, [
+            ("api_post", (self.CONFIG, "/UserFavoriteItems/a%2Fb%20c?userId=u", {})),
         ])
 
 

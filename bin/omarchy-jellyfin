@@ -1430,7 +1430,10 @@ def cmd_favorite(args):
     config = load_config()
     item_id = args.item_id
     favorite = args.action == "favorite"
-    endpoint = "/Users/%s/FavoriteItems/%s" % (config["userId"], item_id)
+    endpoint = "/UserFavoriteItems/%s?userId=%s" % (
+        urllib.parse.quote(str(item_id), safe=""),
+        config["userId"],
+    )
 
     if favorite:
         api_post(config, endpoint, {})
@@ -1438,11 +1441,14 @@ def cmd_favorite(args):
         api_delete(config, endpoint)
 
     queue = read_queue()
+    matched = False
     for track in queue:
         if track.get("id") == item_id:
             track["favorite"] = favorite
-            break
-    write_queue(queue)
+            matched = True
+
+    if matched:
+        write_queue(queue)
 
     if args.json:
         print(json.dumps({"favorite": favorite}))

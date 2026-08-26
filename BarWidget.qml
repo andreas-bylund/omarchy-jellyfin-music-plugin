@@ -40,6 +40,7 @@ Panel {
   readonly property string glyphPrev: String.fromCodePoint(0xF04AE)
   readonly property string glyphShuffle: String.fromCodePoint(0xF049D)
   readonly property string glyphHeart: String.fromCodePoint(0xF02D1)
+  readonly property string glyphHeartOutline: String.fromCodePoint(0xF02D5)
   readonly property string glyphPlaylist: String.fromCodePoint(0xF0CB9)
   // Chevrons point the way through the library rather than folding a section
   // open in place: right goes a level in, left comes back out.
@@ -1324,7 +1325,7 @@ Panel {
                 Text {
                   id: favoriteButton
                   visible: root.track !== null
-                  text: root.track && root.track.favorite ? root.glyphHeart : "\u2665"
+                  text: root.track && root.track.favorite ? root.glyphHeart : root.glyphHeartOutline
                   color: favoriteArea.containsMouse || (root.track && root.track.favorite)
                     ? root.foreground : root.dim
                   font.family: root.fontFamily
