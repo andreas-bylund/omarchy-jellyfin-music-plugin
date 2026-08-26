@@ -211,8 +211,12 @@ class TrackFromItemTest(unittest.TestCase):
         track = jf.track_from_item({})
         self.assertEqual(
             track,
-            {"id": "", "title": "Unknown", "artist": "", "album": "", "artId": "", "duration": 0},
+            {"id": "", "title": "Unknown", "artist": "", "album": "", "artId": "", "duration": 0, "favorite": False},
         )
+
+    def test_reads_favorite_from_user_data(self):
+        track = jf.track_from_item({"Id": "1", "UserData": {"IsFavorite": True}})
+        self.assertTrue(track["favorite"])
 
     def test_art_comes_from_the_album(self):
         track = jf.track_from_item({"Id": "track1", "Name": "x", "AlbumId": "album9"})
@@ -575,6 +579,78 @@ class BarePlayTest(unittest.TestCase):
         with self.assertRaises(jf.JellyfinError):
             jf.cmd_play(self.ARGS)
         self.assertEqual(self.calls, [])
+
+
+class FavoriteTest(unittest.TestCase):
+    """Favorite/unfavorite by item id, with I/O swapped out."""
+
+    CONFIG = {"server": "http://jf.local", "token": "t", "userId": "u", "deviceId": "d"}
+    TRACK = {"id": "track1", "title": "One", "artist": "X", "favorite": False}
+
+    def setUp(self):
+        self.calls = []
+        self.patch("load_config", lambda required=True: dict(self.CONFIG))
+        self.patch("api_post", lambda *args: self.calls.append(("api_post", args)))
+        self.patch("api_delete", lambda *args: self.calls.append(("api_delete", args)))
+        self.patch(
+            "write_queue",
+            lambda tracks: self.calls.append(("write_queue", list(tracks))),
+        )
+
+    def patch(self, name, stub):
+        original = getattr(jf, name)
+        setattr(jf, name, stub)
+        self.addCleanup(setattr, jf, name, original)
+
+    def _args(self, item_id, action, json=False):
+        return types.SimpleNamespace(item_id=item_id, action=action, json=json)
+
+    def test_favorite_calls_post_and_updates_queue(self):
+        self.patch("read_queue", lambda: [dict(self.TRACK)])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            jf.cmd_favorite(self._args("track1", "favorite"))
+        self.assertEqual(self.calls, [
+            ("api_post", (self.CONFIG, "/UserFavoriteItems/track1?userId=u", {})),
+            ("write_queue", [{"id": "track1", "title": "One", "artist": "X", "favorite": True}]),
+        ])
+        self.assertIn("Favorited.", out.getvalue())
+
+    def test_unfavorite_calls_delete_and_updates_queue(self):
+        self.patch("read_queue", lambda: [dict(self.TRACK, favorite=True)])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            jf.cmd_favorite(self._args("track1", "unfavorite"))
+        self.assertEqual(self.calls, [
+            ("api_delete", (self.CONFIG, "/UserFavoriteItems/track1?userId=u")),
+            ("write_queue", [{"id": "track1", "title": "One", "artist": "X", "favorite": False}]),
+        ])
+        self.assertIn("Unfavorited.", out.getvalue())
+
+    def test_outputs_json_when_asked(self):
+        self.patch("read_queue", lambda: [dict(self.TRACK)])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            jf.cmd_favorite(self._args("track1", "favorite", json=True))
+        self.assertEqual(json.loads(out.getvalue()), {"favorite": True})
+
+    def test_skips_queue_update_when_track_is_absent(self):
+        self.patch("read_queue", lambda: [dict(self.TRACK)])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            jf.cmd_favorite(self._args("missing", "favorite"))
+        self.assertEqual(self.calls, [
+            ("api_post", (self.CONFIG, "/UserFavoriteItems/missing?userId=u", {})),
+        ])
+
+    def test_quotes_item_id_in_path(self):
+        self.patch("read_queue", list)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            jf.cmd_favorite(self._args("a/b c", "favorite"))
+        self.assertEqual(self.calls, [
+            ("api_post", (self.CONFIG, "/UserFavoriteItems/a%2Fb%20c?userId=u", {})),
+        ])
 
 
 class MergeStatusTest(unittest.TestCase):
