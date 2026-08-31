@@ -287,6 +287,20 @@ Panel {
           command: playAll
         })
       }
+
+	  var shuffleAll = levelShuffleAll(level)
+	  if (shuffleAll && !searchMode && browseRows.length > 0) {
+		var unit = level.kind === "artist" ? " album" : " track"
+		trail.push({
+          kind: "action",
+          key: "shuffle-all",
+          label: "Shuffle all",
+          detail: rows.length + unit + (rows.length === 1 ? "" : "s"),
+          glyph: glyphShuffle,
+          command: shuffleAll
+        })
+	  }
+
       if (browseRows.length === 0)
         return trail.concat([{
           kind: "note",
@@ -364,6 +378,15 @@ Panel {
     if (entry.kind === "album") return ["play", "--album", entry.key]
     if (entry.kind === "playlist") return ["play", "--playlist", entry.key]
     if (entry.kind === "favorites") return ["play", "--favorites"]
+    return null
+  }
+
+  function levelShuffleAll(entry) {
+	if (!entry) return null
+	if (entry.kind === "artist") return ["play", "--shuffle", "--limit", String(setting("shuffleLimit", 200)), "--artist", entry.key]
+	if (entry.kind === "album") return ["play", "--shuffle", "--limit", String(setting("shuffleLimit", 200)), "--album", entry.key]
+	if (entry.kind === "playlist") return ["play", "--shuffle", "--limit", String(setting("shuffleLimit", 200)), "--playlist", entry.key]
+	if (entry.kind === "favorites") return ["play", "--shuffle", "--limit", String(setting("shuffleLimit", 200)), "--favorites"]
     return null
   }
 
