@@ -31,6 +31,9 @@ import urllib.request
 
 CLIENT_NAME = "Omarchy"
 CLIENT_VERSION = "0.1.0"
+# urllib's default is "Python-urllib/3.x", which Cloudflare's bot protection
+# rejects with a 403 before the request reaches Jellyfin. Any other value passes.
+USER_AGENT = "omarchy-jellyfin/%s" % CLIENT_VERSION
 
 CONFIG_DIR = os.path.join(
     os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
@@ -656,7 +659,8 @@ def probe_server(url, insecure=False):
     """Whether a Jellyfin server answers here. Returns its name, or None."""
     try:
         request = urllib.request.Request(
-            url + "/System/Info/Public", headers={"Accept": "application/json"}
+            url + "/System/Info/Public",
+            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
         )
         with urllib.request.urlopen(request, timeout=5, context=ssl_context(insecure)) as response:
             data = json.loads(response.read().decode("utf-8"))
@@ -696,6 +700,7 @@ def _api_request(config, url, payload, unauthorized=None, method=None):
     headers = {
         "Authorization": auth_header(config.get("token"), config["deviceId"]),
         "Accept": "application/json",
+        "User-Agent": USER_AGENT,
     }
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")

@@ -194,6 +194,36 @@ class AuthHeaderTest(unittest.TestCase):
         self.assertIn('Token="abc"', jf.auth_header("abc", "dev123"))
 
 
+class UserAgentTest(unittest.TestCase):
+    """Cloudflare answers 403 to urllib's default User-Agent, so every request
+    has to carry our own."""
+
+    def capture(self, fn):
+        seen = []
+
+        def fake_urlopen(request, **_kwargs):
+            seen.append(request)
+            return contextlib.closing(io.BytesIO(b'{"ServerName": "x"}'))
+
+        real = jf.urllib.request.urlopen
+        jf.urllib.request.urlopen = fake_urlopen
+        try:
+            fn()
+        finally:
+            jf.urllib.request.urlopen = real
+        self.assertEqual(len(seen), 1)
+        return seen[0]
+
+    def test_probe_sends_our_user_agent(self):
+        request = self.capture(lambda: jf.probe_server("https://jf.example.com"))
+        self.assertEqual(request.get_header("User-agent"), jf.USER_AGENT)
+
+    def test_api_requests_send_our_user_agent(self):
+        config = {"server": "https://jf.example.com", "deviceId": "dev", "token": None}
+        request = self.capture(lambda: jf.api_get(config, "/System/Info"))
+        self.assertEqual(request.get_header("User-agent"), jf.USER_AGENT)
+
+
 class TrackFromItemTest(unittest.TestCase):
     def test_converts_ticks_to_seconds(self):
         track = jf.track_from_item({"Id": "1", "Name": "So What", "RunTimeTicks": 5_450_000_000})
