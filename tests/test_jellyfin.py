@@ -348,6 +348,42 @@ class BrowseParamsTest(unittest.TestCase):
         self.assertIn("ArtistIds", jf.browse_params("MusicAlbum", "u1", 10, "a9"))
 
 
+class ArtistsListingTest(unittest.TestCase):
+    def test_lists_everyone_from_the_artists_endpoint(self):
+        endpoint, params = jf.artists_listing("u1", 2000)
+        self.assertEqual(endpoint, "/Artists")
+        self.assertEqual(params["userId"], "u1")
+        self.assertEqual(params["Limit"], 2000)
+        self.assertEqual(params["SortBy"], "SortName")
+        self.assertNotIn("SearchTerm", params)
+
+    def test_search_term_rides_along(self):
+        _, params = jf.artists_listing("u1", 5, "metallica")
+        self.assertEqual(params["SearchTerm"], "metallica")
+
+
+class SearchLibraryRoutingTest(unittest.TestCase):
+    """Artist search goes to /Artists, everything else to /Items."""
+
+    CONFIG = {"server": "http://jf.local", "token": "t", "userId": "u", "deviceId": "d"}
+
+    def test_artist_search_uses_the_artists_endpoint(self):
+        calls = []
+        original = jf.api_get
+
+        def fake(config, endpoint, params=None):
+            calls.append(endpoint)
+            if endpoint.startswith("/Artists"):
+                return {"Items": [{"Type": "MusicArtist", "Id": "a1", "Name": "X"}]}
+            return {"Items": []}
+
+        jf.api_get = fake
+        self.addCleanup(setattr, jf, "api_get", original)
+        entries = jf.search_library(dict(self.CONFIG), "x")
+        self.assertIn("/Artists", calls)
+        self.assertEqual(entries[0]["type"], "artist")
+
+
 class ArtUrlTest(unittest.TestCase):
     CONFIG = {"server": "https://jf.local", "token": "tok"}
 
