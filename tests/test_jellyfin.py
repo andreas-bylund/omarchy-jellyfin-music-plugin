@@ -328,6 +328,15 @@ class TrackEntriesTest(unittest.TestCase):
         self.assertEqual(jf.track_entries([]), [])
 
 
+class ArtistIdFieldTest(unittest.TestCase):
+    def test_everything_they_appear_on_by_default(self):
+        self.assertEqual(jf.artist_id_field(), "ArtistIds")
+        self.assertEqual(jf.artist_id_field(False), "ArtistIds")
+
+    def test_only_what_is_filed_under_them_when_asked(self):
+        self.assertEqual(jf.artist_id_field(True), "AlbumArtistIds")
+
+
 class BrowseParamsTest(unittest.TestCase):
     def test_a_plain_listing_is_alphabetical(self):
         params = jf.browse_params("MusicArtist", "u1", 2000)
@@ -347,6 +356,13 @@ class BrowseParamsTest(unittest.TestCase):
         # `play --artist` would actually queue, guest spots and all.
         self.assertIn("ArtistIds", jf.browse_params("MusicAlbum", "u1", 10, "a9"))
 
+    def test_album_artists_only_stays_with_what_is_filed_under_them(self):
+        params = jf.browse_params(
+            "MusicAlbum", "u1", 2000, artist_id="a9", album_artists_only=True
+        )
+        self.assertEqual(params["AlbumArtistIds"], "a9")
+        self.assertNotIn("ArtistIds", params)
+
 
 class ArtistsListingTest(unittest.TestCase):
     def test_lists_everyone_from_the_artists_endpoint(self):
@@ -357,31 +373,13 @@ class ArtistsListingTest(unittest.TestCase):
         self.assertEqual(params["SortBy"], "SortName")
         self.assertNotIn("SearchTerm", params)
 
+    def test_album_artists_only_uses_the_album_artists_endpoint(self):
+        endpoint, _ = jf.artists_listing("u1", 2000, album_artists_only=True)
+        self.assertEqual(endpoint, "/Artists/AlbumArtists")
+
     def test_search_term_rides_along(self):
         _, params = jf.artists_listing("u1", 5, "metallica")
         self.assertEqual(params["SearchTerm"], "metallica")
-
-
-class SearchLibraryRoutingTest(unittest.TestCase):
-    """Artist search goes to /Artists, everything else to /Items."""
-
-    CONFIG = {"server": "http://jf.local", "token": "t", "userId": "u", "deviceId": "d"}
-
-    def test_artist_search_uses_the_artists_endpoint(self):
-        calls = []
-        original = jf.api_get
-
-        def fake(config, endpoint, params=None):
-            calls.append(endpoint)
-            if endpoint.startswith("/Artists"):
-                return {"Items": [{"Type": "MusicArtist", "Id": "a1", "Name": "X"}]}
-            return {"Items": []}
-
-        jf.api_get = fake
-        self.addCleanup(setattr, jf, "api_get", original)
-        entries = jf.search_library(dict(self.CONFIG), "x")
-        self.assertIn("/Artists", calls)
-        self.assertEqual(entries[0]["type"], "artist")
 
 
 class ArtUrlTest(unittest.TestCase):
@@ -573,6 +571,7 @@ class BarePlayTest(unittest.TestCase):
     ARGS = types.SimpleNamespace(
         playlist=None, album=None, artist=None, search=None, item=None,
         favorites=False, shuffle=False, start=None, limit=200,
+        album_artists_only=False,
     )
 
     def setUp(self):
@@ -615,6 +614,80 @@ class BarePlayTest(unittest.TestCase):
         with self.assertRaises(jf.JellyfinError):
             jf.cmd_play(self.ARGS)
         self.assertEqual(self.calls, [])
+
+    def _artist_args(self, album_artists_only):
+        return types.SimpleNamespace(
+            playlist=None, album=None, artist="a9", search=None, item=None,
+            favorites=False, shuffle=False, start=None, limit=200,
+            album_artists_only=album_artists_only,
+        )
+
+    def test_playing_an_artist_includes_guest_spots_by_default(self):
+        seen = {}
+        self.patch("load_config", lambda required=True: dict(self.CONFIG))
+        self.patch(
+            "fetch_tracks",
+            lambda config, params: (
+                seen.setdefault("params", params),
+                [{"id": "t1", "title": "One", "artist": "X"}],
+            )[1],
+        )
+        self.patch("enqueue", lambda *a, **k: None)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            jf.cmd_play(self._artist_args(False))
+        self.assertIn("ArtistIds", seen["params"])
+        self.assertEqual(seen["params"]["ArtistIds"], "a9")
+
+    def test_playing_an_artist_with_album_artists_only_stays_filed(self):
+        seen = {}
+        self.patch("load_config", lambda required=True: dict(self.CONFIG))
+        self.patch(
+            "fetch_tracks",
+            lambda config, params: (
+                seen.setdefault("params", params),
+                [{"id": "t1", "title": "One", "artist": "X"}],
+            )[1],
+        )
+        self.patch("enqueue", lambda *a, **k: None)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            jf.cmd_play(self._artist_args(True))
+        self.assertIn("AlbumArtistIds", seen["params"])
+        self.assertNotIn("ArtistIds", seen["params"])
+
+
+class SearchLibraryRoutingTest(unittest.TestCase):
+    """Artist search goes to /Artists, everything else to /Items."""
+
+    CONFIG = {"server": "http://jf.local", "token": "t", "userId": "u", "deviceId": "d"}
+
+    def run_search(self, album_artists_only):
+        calls = []
+        original = jf.api_get
+
+        def fake(config, endpoint, params=None):
+            calls.append(endpoint)
+            if endpoint.startswith("/Artists"):
+                return {"Items": [{"Type": "MusicArtist", "Id": "a1", "Name": "X"}]}
+            return {"Items": []}
+
+        jf.api_get = fake
+        self.addCleanup(setattr, jf, "api_get", original)
+        entries = jf.search_library(
+            dict(self.CONFIG), "x", album_artists_only=album_artists_only
+        )
+        return calls, entries
+
+    def test_artist_search_uses_the_artists_endpoint(self):
+        calls, entries = self.run_search(False)
+        self.assertIn("/Artists", calls)
+        self.assertNotIn("/Artists/AlbumArtists", calls)
+        self.assertEqual(entries[0]["type"], "artist")
+
+    def test_album_artists_only_searches_album_artists(self):
+        calls, _ = self.run_search(True)
+        self.assertIn("/Artists/AlbumArtists", calls)
 
 
 class FavoriteTest(unittest.TestCase):

@@ -134,6 +134,10 @@ Panel {
   readonly property bool showArt: setting("showAlbumArt", true)
   readonly property bool showBarTitle: setting("showBarTitle", true)
   readonly property bool scrollTitle: setting("scrollBarTitle", true)
+  // Album artists only: hide collaboration splits like "A & B" from the
+  // artists list and artist search. Their tracks already sit under the main
+  // artist, so nothing is lost -- the list just reads as bands again.
+  readonly property bool albumArtistsOnly: setting("albumArtistsOnly", false)
 
   readonly property string tooltip: {
     if (!loggedIn) return "Jellyfin Music — not connected"
@@ -169,11 +173,20 @@ Panel {
     return "track"
   }
 
+  // The flag appended whenever artists are listed, filtered, or played.
+  // One place so the browse level, search, discography, and Play all can
+  // never disagree about what an artist means.
+  function artistFlag() {
+    return root.albumArtistsOnly ? ["--album-artists-only"] : []
+  }
+
   // What the CLI is asked for to fill a level.
   function levelCommand(entry) {
-    if (entry.kind === "artist") return ["albums", "--artist", entry.key, "--json"]
+    if (entry.kind === "artist")
+      return ["albums", "--artist", entry.key].concat(artistFlag()).concat(["--json"])
     if (entry.kind === "album") return ["tracks", "--album", entry.key, "--json"]
     if (entry.kind === "playlist") return ["tracks", "--playlist", entry.key, "--json"]
+    if (entry.kind === "artists") return ["artists"].concat(artistFlag()).concat(["--json"])
     return [entry.kind, "--json"]
   }
 
@@ -333,6 +346,16 @@ Panel {
   // end, and a level you step out of is shorter than the one you were in.
   onNavRowsChanged: clampCursor()
 
+  // The artists list on screen was built under the other mode. Reload what
+  // is showing rather than leaving a stale 62 next to a setting that
+  // promises 43, and re-run a search in flight. Closed, the next open reads
+  // the new flag when it builds its commands, so there is nothing to do.
+  onAlbumArtistsOnlyChanged: {
+    if (!opened) return
+    if (searchMode && path.length === 0) runSearch()
+    else if (level) loadLevel(level)
+  }
+
   function clampCursor() {
     if (rowIndex >= navRows.length) rowIndex = Math.max(0, navRows.length - 1)
     if (rowIndex < 0) rowIndex = 0
@@ -360,7 +383,8 @@ Panel {
   // a thing you play -- the queue, or the lists of everything.
   function levelPlayAll(entry) {
     if (!entry) return null
-    if (entry.kind === "artist") return ["play", "--artist", entry.key]
+    if (entry.kind === "artist")
+      return ["play", "--artist", entry.key].concat(artistFlag())
     if (entry.kind === "album") return ["play", "--album", entry.key]
     if (entry.kind === "playlist") return ["play", "--playlist", entry.key]
     if (entry.kind === "favorites") return ["play", "--favorites"]
@@ -485,7 +509,7 @@ Panel {
     if (searchProc.running) { searchDebounce.restart(); return }
     notice = ""
     searchProc.query = query
-    searchProc.command = [cli, "search", query, "--json"]
+    searchProc.command = [cli, "search", query, "--json"].concat(artistFlag())
     searchProc.running = true
   }
 
@@ -1248,6 +1272,16 @@ Panel {
               foreground: root.foreground
               fontFamily: root.fontFamily
               onClicked: root.persist("scrollBarTitle", root.scrollTitle ? "false" : "true")
+            }
+
+            Toggle {
+              width: parent.width
+              label: "Album artists only"
+              description: "Hide splits like 'A & B' — their songs sit under the main artist"
+              checked: root.albumArtistsOnly
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: root.persist("albumArtistsOnly", root.albumArtistsOnly ? "false" : "true")
             }
           }
 
