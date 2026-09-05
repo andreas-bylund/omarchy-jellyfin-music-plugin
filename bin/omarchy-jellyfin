@@ -410,6 +410,28 @@ def browse_params(item_type, user_id, limit, artist_id=None):
     return params
 
 
+def artists_listing(user_id, limit, search_term=None):
+    """Endpoint and query behind the artists listing and artist search.
+
+    Artists come from /Artists, not from /Items with
+    IncludeItemTypes=MusicArtist. The latter only returns artist items stored
+    as folders -- on a library not laid out as Music/Artist/Album that is a
+    couple of top-level directories ("FLAC", "Music") instead of the bands.
+    /Artists is built from the track metadata instead, so it lists the real
+    artists and honors SearchTerm, and its ids still work with the ArtistIds
+    filter for albums and playback.
+    """
+    params = {
+        "Recursive": "true",
+        "userId": user_id,
+        "SortBy": "SortName",
+        "Limit": limit,
+    }
+    if search_term:
+        params["SearchTerm"] = search_term
+    return "/Artists", params
+
+
 def art_url(config, track, size=192):
     """Cover art for a track, or "" when there is nothing to point at.
 
@@ -777,19 +799,23 @@ def search_library(config, query, limits=SEARCH_LIMITS):
     """
     entries = []
     for item_type, limit in limits:
-        result = api_get(
-            config,
-            "/Items",
-            {
-                "SearchTerm": query,
-                "IncludeItemTypes": item_type,
-                "Recursive": "true",
-                "Fields": "Artists,Album,RunTimeTicks",
-                "userId": config["userId"],
-                "SortBy": "SortName",
-                "Limit": limit,
-            },
-        )
+        if item_type == "MusicArtist":
+            endpoint, params = artists_listing(config["userId"], limit, query)
+            result = api_get(config, endpoint, params)
+        else:
+            result = api_get(
+                config,
+                "/Items",
+                {
+                    "SearchTerm": query,
+                    "IncludeItemTypes": item_type,
+                    "Recursive": "true",
+                    "Fields": "Artists,Album,RunTimeTicks",
+                    "userId": config["userId"],
+                    "SortBy": "SortName",
+                    "Limit": limit,
+                },
+            )
         entries.extend(search_entry(item) for item in items_of(result))
     return entries
 
@@ -1225,9 +1251,8 @@ def cmd_playlists(args):
 
 def cmd_artists(args):
     config = load_config()
-    result = api_get(
-        config, "/Items", browse_params("MusicArtist", config["userId"], args.limit)
-    )
+    endpoint, params = artists_listing(config["userId"], args.limit)
+    result = api_get(config, endpoint, params)
     _print_entries([named_entry(item) for item in items_of(result)], args.json, args.limit)
 
 
