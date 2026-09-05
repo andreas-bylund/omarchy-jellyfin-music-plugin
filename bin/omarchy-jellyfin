@@ -388,14 +388,23 @@ def track_entries(tracks):
     ]
 
 
-def browse_params(item_type, user_id, limit, artist_id=None):
+def artist_id_field(album_artists_only=False):
+    """Which filter files an artist's entries under them.
+
+    ArtistIds is everything they appear on, guest spots included -- which is
+    why the discography lists what `play --artist` queues. AlbumArtistIds is
+    only what is filed under them, keeping guest spots with the album they
+    were released on.
+    """
+    return "AlbumArtistIds" if album_artists_only else "ArtistIds"
+
+
+def browse_params(item_type, user_id, limit, artist_id=None, album_artists_only=False):
     """The /Items query behind one browse listing.
 
-    Albums are filtered by ArtistIds rather than AlbumArtistIds, deliberately
-    and in step with `play --artist`: what the discography lists is what
-    playing that artist actually gives you, guest spots included. Those are
-    ordered by year, which is how a discography is read; every other listing is
-    alphabetical, which is how you scan for a name.
+    Albums under an artist read as a discography: ordered by year, which is
+    how a discography is read; every other listing is alphabetical, which is
+    how you scan for a name.
     """
     params = {
         "IncludeItemTypes": item_type,
@@ -405,12 +414,12 @@ def browse_params(item_type, user_id, limit, artist_id=None):
         "Limit": limit,
     }
     if artist_id:
-        params["ArtistIds"] = artist_id
+        params[artist_id_field(album_artists_only)] = artist_id
         params["SortBy"] = "ProductionYear,SortName"
     return params
 
 
-def artists_listing(user_id, limit, search_term=None):
+def artists_listing(user_id, limit, search_term=None, album_artists_only=False):
     """Endpoint and query behind the artists listing and artist search.
 
     Artists come from /Artists, not from /Items with
@@ -419,17 +428,32 @@ def artists_listing(user_id, limit, search_term=None):
     couple of top-level directories ("FLAC", "Music") instead of the bands.
     /Artists is built from the track metadata instead, so it lists the real
     artists and honors SearchTerm, and its ids still work with the ArtistIds
-    filter for albums and playback.
+    filter for albums and playback. /Artists/AlbumArtists narrows that to the
+    album artists, hiding collaboration splits like "A & B" whose tracks
+    already sit under the main artist.
     """
+    endpoint = "/Artists/AlbumArtists" if album_artists_only else "/Artists"
     params = {
-        "Recursive": "true",
         "userId": user_id,
         "SortBy": "SortName",
         "Limit": limit,
     }
     if search_term:
         params["SearchTerm"] = search_term
-    return "/Artists", params
+    return endpoint, params
+
+
+def add_album_artists_flag(sub, help):
+    """The --album-artists-only flag shared by artists, albums, search, play.
+
+    One spelling in one place: the widget passes it whenever its Album artists
+    only setting is on.
+    """
+    sub.add_argument(
+        "--album-artists-only",
+        action="store_true",
+        help=help,
+    )
 
 
 def art_url(config, track, size=192):
@@ -790,7 +814,7 @@ def playlist_tracks(config, playlist_id):
     return [track_from_item(item) for item in items_of(result)]
 
 
-def search_library(config, query, limits=SEARCH_LIMITS):
+def search_library(config, query, limits=SEARCH_LIMITS, album_artists_only=False):
     """Look for artists, albums and tracks matching a query, in that order.
 
     One request per type rather than a single mixed one: a query that matches
@@ -800,7 +824,9 @@ def search_library(config, query, limits=SEARCH_LIMITS):
     entries = []
     for item_type, limit in limits:
         if item_type == "MusicArtist":
-            endpoint, params = artists_listing(config["userId"], limit, query)
+            endpoint, params = artists_listing(
+                config["userId"], limit, query, album_artists_only
+            )
             result = api_get(config, endpoint, params)
         else:
             result = api_get(
@@ -1251,7 +1277,9 @@ def cmd_playlists(args):
 
 def cmd_artists(args):
     config = load_config()
-    endpoint, params = artists_listing(config["userId"], args.limit)
+    endpoint, params = artists_listing(
+        config["userId"], args.limit, album_artists_only=args.album_artists_only
+    )
     result = api_get(config, endpoint, params)
     _print_entries([named_entry(item) for item in items_of(result)], args.json, args.limit)
 
@@ -1261,7 +1289,13 @@ def cmd_albums(args):
     result = api_get(
         config,
         "/Items",
-        browse_params("MusicAlbum", config["userId"], args.limit, args.artist),
+        browse_params(
+            "MusicAlbum",
+            config["userId"],
+            args.limit,
+            artist_id=args.artist,
+            album_artists_only=args.album_artists_only,
+        ),
     )
     entries = [
         album_entry(item, implied_artist=bool(args.artist)) for item in items_of(result)
@@ -1297,7 +1331,9 @@ def cmd_search(args):
     query = (args.query or "").strip()
     if not query:
         raise JellyfinError("Nothing to search for.")
-    entries = search_library(config, query)
+    entries = search_library(
+        config, query, album_artists_only=args.album_artists_only
+    )
     if args.json:
         print(json.dumps(entries))
         return
@@ -1343,10 +1379,13 @@ def cmd_play(args):
         )
     elif args.artist:
         # Everything they appear on, album by album -- ArtistIds rather than
-        # AlbumArtistIds, so a guest spot counts too.
+        # AlbumArtistIds, so a guest spot counts too. With
+        # --album-artists-only the filter narrows to AlbumArtistIds instead,
+        # keeping guest spots with the album they were released on.
+        field = artist_id_field(args.album_artists_only)
         tracks = fetch_tracks(
             config,
-            {"ArtistIds": args.artist, "SortBy": "Album,ParentIndexNumber,IndexNumber"},
+            {field: args.artist, "SortBy": "Album,ParentIndexNumber,IndexNumber"},
         )
     elif args.search:
         tracks = fetch_tracks(
@@ -1542,12 +1581,19 @@ def build_parser():
     artists = sub.add_parser("artists", help="list every artist in the library")
     artists.add_argument("--limit", type=int, default=BROWSE_LIMIT)
     artists.add_argument("--json", action="store_true")
+    add_album_artists_flag(
+        artists, "list album artists only, hiding collaboration splits like 'A & B'"
+    )
     artists.set_defaults(func=cmd_artists)
 
     albums = sub.add_parser("albums", help="list albums, all of them or one artist's")
     albums.add_argument("--artist", help="artist id: their discography, oldest first")
     albums.add_argument("--limit", type=int, default=BROWSE_LIMIT)
     albums.add_argument("--json", action="store_true")
+    add_album_artists_flag(
+        albums,
+        "with --artist, stay with albums filed under them instead of guest spots too",
+    )
     albums.set_defaults(func=cmd_albums)
 
     tracks = sub.add_parser("tracks", help="list the tracks of an album or a playlist")
@@ -1560,12 +1606,19 @@ def build_parser():
     search = sub.add_parser("search", help="search artists, albums and tracks")
     search.add_argument("query")
     search.add_argument("--json", action="store_true")
+    add_album_artists_flag(
+        search, "search album artists only, hiding collaboration splits"
+    )
     search.set_defaults(func=cmd_search)
 
     play = sub.add_parser("play", help="start playback")
     play.add_argument("--playlist", help="playlist id")
     play.add_argument("--album", help="album id")
     play.add_argument("--artist", help="artist id: everything they appear on")
+    add_album_artists_flag(
+        play,
+        "with --artist, play only what is filed under them instead of guest spots too",
+    )
     play.add_argument("--search", help="queue what a search matches")
     play.add_argument("--item", help="single track id")
     play.add_argument("--favorites", action="store_true")

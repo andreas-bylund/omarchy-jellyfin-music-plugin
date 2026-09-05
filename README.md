@@ -146,6 +146,13 @@ would rather look than search. An artist opens their discography, oldest first;
 an album opens its tracks. Each level replaces the one before it, with the trail
 back along the top.
 
+**Artists** lists album artists — the names records are filed under. Jellyfin
+also keeps every credit it could not split as an artist of its own, and on a
+library of sixty bands that is two hundred more rows of `2Pac feat. Dr. Dre &
+Roger Troutman`, none of them leading anywhere `2Pac` does not. The **Album
+artists only** toggle in the gear hides them; turn it off to see the lot, which
+also files an artist's guest spots under them when you open or play them.
+
 One rule, no exceptions: **a row with something inside it opens, and a row that
 is the thing itself plays.** The chevron tells you which you are looking at, so
 artists, albums and playlists open, and tracks play.
@@ -206,7 +213,7 @@ fill in.
 <img src="docs/images/settings.png" width="400"
      alt="The gear panel: a Connection block naming the signed-in user and server with Switch server and Log out beside it, then toggles for album art, the bar title, and scrolling that title.">
 
-The three toggles here are the ones worth reaching for while the music is in
+The four toggles here are the ones worth reaching for while the music is in
 front of you. The rest — the title's width, and how much `Shuffle all` pulls —
 live in Omarchy's plugin settings, where you set them once.
 
@@ -261,6 +268,12 @@ Add `--json` to `status`, `volume`, `queue`, `favorite`, `playlists`, `favorites
 `search`, `artists`, `albums`, and `tracks` for machine output. The listing commands share
 one row shape — `{id, name, detail}` — because what they list differs but what
 you do with it next does not.
+
+`--album-artists-only` is the CLI side of the **Album artists only** toggle. On
+`artists` and `search` it lists album artists rather than every credit; on
+`albums --artist` and `play --artist` it stays with the records filed under
+them rather than everything they appear on. The widget passes it whenever the
+toggle is on, which it is by default.
 
 `artists` and `albums` stop at 2000 entries and say so on stderr; a library
 larger than that is one you search rather than scroll.
