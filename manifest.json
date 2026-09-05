@@ -24,7 +24,7 @@
       "barTitleWidth": 110,
       "scrollBarTitle": true,
       "showBarTitle": true,
-      "albumArtistsOnly": false
+      "albumArtistsOnly": true
     },
     "schema": [
       {
@@ -71,7 +71,7 @@
         "key": "albumArtistsOnly",
         "type": "boolean",
         "label": "Album artists only",
-        "defaultValue": false,
+        "defaultValue": true,
         "description": "Hide collaboration splits like 'A & B' from Artists and search. Their tracks already sit under the main artist. Also toggleable from the gear inside the panel."
       }
     ]

@@ -434,7 +434,6 @@ def artists_listing(user_id, limit, search_term=None, album_artists_only=False):
     """
     endpoint = "/Artists/AlbumArtists" if album_artists_only else "/Artists"
     params = {
-        "Recursive": "true",
         "userId": user_id,
         "SortBy": "SortName",
         "Limit": limit,

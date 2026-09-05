@@ -137,7 +137,11 @@ Panel {
   // Album artists only: hide collaboration splits like "A & B" from the
   // artists list and artist search. Their tracks already sit under the main
   // artist, so nothing is lost -- the list just reads as bands again.
-  readonly property bool albumArtistsOnly: setting("albumArtistsOnly", false)
+  // On by default: Jellyfin keeps every credit it could not split as an
+  // artist of its own, and on a library of sixty bands that was two hundred
+  // rows of "X feat. Y" in between them. Jellyfin's own client leads with
+  // album artists for the same reason.
+  readonly property bool albumArtistsOnly: setting("albumArtistsOnly", true)
 
   readonly property string tooltip: {
     if (!loggedIn) return "Jellyfin Music — not connected"
